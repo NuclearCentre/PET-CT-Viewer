@@ -1,0 +1,64 @@
+/* App.css */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+input, textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* ── CS3D annotation SVG clipping ──────────────────────────────────────────
+   CS3D appends its SVG annotation layer and canvas directly inside the div
+   we pass as the viewport element (divRef). That SVG has overflow:visible
+   set inline, so labels escape the box. We clip at every level:
+   - .viewport-element   (CS3D's outer wrapper)
+   - canvas              (pixel render)
+   - .svg-layer          (annotation SVG wrapper)
+   - svg itself          (the actual SVG element)
+   clipPath: inset(0) works even on SVG children with overflow:visible.
+*/
+.viewport-element {
+  overflow: hidden !important;
+  clip-path: inset(0px) !important;
+}
+
+.viewport-element > canvas {
+  clip-path: inset(0px) !important;
+}
+
+.viewport-element > .svg-layer {
+  overflow: hidden !important;
+  clip-path: inset(0px) !important;
+}
+
+.viewport-element > .svg-layer > svg,
+.viewport-element svg {
+  overflow: hidden !important;
+  clip-path: inset(0px) !important;
+}
+
+/* ── MIP viewport — inverted greyscale (white bg, dark organs/lesions) ──────
+   The MIP renders on a BLACK clear colour (set in ViewerBox.jsx VP_BACKGROUND).
+   We invert ONLY the CS3D render canvas, so:
+       black background  → white
+       bright FDG uptake → dark
+   This is a true photometric inversion and does not depend on CS3D colormap
+   registration (which wasn't applying on the volume MIP actor).
+
+   IMPORTANT: the selector is scoped to `.viewport-element canvas` so it inverts
+   the image canvas ONLY — NOT the colormap-strip <canvas> (which sits outside
+   .viewport-element) and NOT the annotation .svg-layer. CT/PET are untouched. */
+.vp-mip {
+  background: #ffffff !important;
+}
+.vp-mip .viewport-element canvas {
+  filter: invert(1) !important;
+}
