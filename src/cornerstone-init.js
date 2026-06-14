@@ -1,19 +1,19 @@
 /**
- * cornerstone-init.js — v2.1.16 verified
+ * cornerstone-init.js - v2.1.16 verified
  *
  * Mouse bindings (stack / Phase 1-2 groups):
- *   Left drag              → Pan
- *   Right drag             → Zoom
- *   Wheel                  → Scroll slices
- *   Middle drag            → Window/Level
- *   Shift + Left drag      → Draw straight line  (LengthTool)
- *   Shift + Right drag     → Draw circle ROI     (CircleROITool)
+ *   Left drag              -> Pan
+ *   Right drag             -> Zoom
+ *   Wheel                  -> Scroll slices
+ *   Middle drag            -> Window/Level
+ *   Shift + Left drag      -> Draw straight line  (LengthTool)
+ *   Shift + Right drag     -> Draw circle ROI     (CircleROITool)
  *
- * Phase 3 MPR group (tg-mpr) — volume/orthographic viewports:
- *   Left drag              → Pan
- *   Right drag             → Zoom
- *   Wheel                  → Scroll slices
- *   Crosshairs             → PASSIVE (reference lines always visible + draggable
+ * Phase 3 MPR group (tg-mpr) - volume/orthographic viewports:
+ *   Left drag              -> Pan
+ *   Right drag             -> Zoom
+ *   Wheel                  -> Scroll slices
+ *   Crosshairs             -> PASSIVE (reference lines always visible + draggable
  *                            centre handle); toolbar "Crosshair" promotes it to
  *                            ACTIVE on Primary for full click-to-navigate.
  *
@@ -62,10 +62,10 @@ import {
 
 import { registerCornerstonePalettes } from './utils/colourPalettes.js';
 
-// ─── Exported IDs ─────────────────────────────────────────────────────────────
+// --- Exported IDs -------------------------------------------------------------
 export const TOOL_GROUP_CT       = 'tg-ct';
 export const TOOL_GROUP_PET      = 'tg-pet';
-export const TOOL_GROUP_MPR      = 'tg-mpr';   // Phase 3 — volume viewports + crosshairs
+export const TOOL_GROUP_MPR      = 'tg-mpr';   // Phase 3 - volume viewports + crosshairs
 export const RENDERING_ENGINE_ID = 'petct-engine';
 export const SYNC_SCROLL_ID      = 'sync-scroll';
 export const SYNC_ZOOM_ID        = 'sync-zoom';
@@ -82,7 +82,7 @@ export const MPR_VIEWPORT_IDS = [
   'pct-axial','pct-coronal','pct-sagittal',
 ];
 
-// Reference-line colour per viewport — CT row blue, PET row green.
+// Reference-line colour per viewport - CT row blue, PET row green.
 const REFERENCE_LINE_COLORS = {
   'ct-axial':    'rgb(136,196,255)', 'ct-coronal':  'rgb(136,196,255)', 'ct-sagittal':  'rgb(136,196,255)',
   'pct-axial':   'rgb(136,221,136)', 'pct-coronal': 'rgb(136,221,136)', 'pct-sagittal': 'rgb(136,221,136)',
@@ -106,7 +106,7 @@ export async function initCornerstone() {
     await toolsInit();
     console.log('[CS3D] tools ready');
 
-    // ── Global annotation style ────────────────────────────────────────────────
+    // -- Global annotation style ------------------------------------------------
     // v2.1.16 exact API (verified from package source):
     //   annotation.config.style.setDefaultToolStyles({ global: { ... } })
     // Without this: textBoxVisibility defaults to true but colors may not
@@ -143,16 +143,17 @@ export async function initCornerstone() {
     ].forEach(T => { try { addTool(T); } catch(e) {} });
     console.log('[CS3D] tools registered');
 
-    // ── Patch CircleROI hit-test + rim resize (verified against v2.1.16 src) ───
+    // -- Patch CircleROI hit-test + rim resize (verified against v2.1.16 src) ---
     // Problem 1: isPointNearTool only hits within 3px of the outline ring, so
     //   clicking inside the ROI pans the image instead of moving the ROI.
-    //   → interior patch: any point inside the circle = hit = move.
+    //   -> interior patch: any point inside the circle = hit = move.
     // Problem 2: the resize handle (points[1]) is a single spot on the rim where
-    //   the user happened to finish drawing — practically impossible to find.
-    //   → rim patch: hovering ANYWHERE on the rim activates the resize handle
+    //   the user happened to finish drawing - practically impossible to find.
+    //   -> rim patch: hovering ANYWHERE on the rim activates the resize handle
     //     (the dot becomes visible and dragging resizes the circle).
-    // Handle check runs BEFORE the tool-move check in CS3D, so: rim → resize,
-    // interior → move, outside → pan. Exactly the standard viewer behaviour.
+    // Handle check runs BEFORE the tool-move check in CS3D, so: rim -> resize,
+    // interior -> move, outside -> pan. Exactly the standard viewer behaviour.
+    _patchCircleHandles(CircleROITool);
     _patchCircleInteriorHit(CircleROITool);
     _patchCircleInteriorHit(EllipticalROITool);
     _patchCircleRimResize(CircleROITool);
@@ -173,9 +174,9 @@ export async function initCornerstone() {
     _createSynchronizers();
     console.log('[CS3D] synchronizers created');
 
-    console.log('[cornerstone-init] ✅ Ready');
+    console.log('[cornerstone-init] Ready');
   } catch(e) {
-    console.error('[cornerstone-init] ❌ Init failed:', e);
+    console.error('[cornerstone-init] Init failed:', e);
     throw e;
   }
 }
@@ -184,37 +185,37 @@ function _createToolGroup(groupId) {
   try { ToolGroupManager.destroyToolGroup(groupId); } catch(e) {}
   const tg = ToolGroupManager.createToolGroup(groupId);
 
-  // ── Navigation — always active ────────────────────────────────────────────
+  // -- Navigation - always active --------------------------------------------
   tg.addTool(WindowLevelTool.toolName);
   tg.addTool(PanTool.toolName);
   tg.addTool(ZoomTool.toolName);
   tg.addTool(StackScrollTool.toolName);
 
-  // Left drag → Pan
+  // Left drag -> Pan
   tg.setToolActive(PanTool.toolName, {
     bindings: [{ mouseButton: MouseBindings.Primary }],
   });
-  // Right drag → Zoom
+  // Right drag -> Zoom
   tg.setToolActive(ZoomTool.toolName, {
     bindings: [{ mouseButton: MouseBindings.Secondary }],
   });
-  // Wheel → Scroll slices
+  // Wheel -> Scroll slices
   tg.setToolActive(StackScrollTool.toolName, {
     bindings: [{ mouseButton: MouseBindings.Wheel }],
   });
-  // Middle drag → Window/Level (kept for mice that have it)
+  // Middle drag -> Window/Level (kept for mice that have it)
   tg.setToolActive(WindowLevelTool.toolName, {
     bindings: [{ mouseButton: MouseBindings.Auxiliary }],
   });
 
-  // ── Annotation combos — Shift/Ctrl + drag ─────────────────────────────────
-  // Shift + Left drag → Straight Line
+  // -- Annotation combos - Shift/Ctrl + drag ---------------------------------
+  // Shift + Left drag -> Straight Line
   tg.addTool(LengthTool.toolName);
   tg.setToolActive(LengthTool.toolName, {
     bindings: [{ mouseButton: MouseBindings.Primary, modifierKey: KeyboardBindings.Shift }],
   });
 
-  // Shift + Right drag → Circle ROI (draw).  Ctrl + Left drag → move existing.
+  // Shift + Right drag -> Circle ROI (draw).  Ctrl + Left drag -> move existing.
   tg.addTool(CircleROITool.toolName);
   tg.setToolActive(CircleROITool.toolName, {
     bindings: [
@@ -223,7 +224,7 @@ function _createToolGroup(groupId) {
     ],
   });
 
-  // ── Other annotation tools — passive (activated via toolbar) ─────────────
+  // -- Other annotation tools - passive (activated via toolbar) -------------
   [RectangleROITool, EllipticalROITool, AngleTool, ArrowAnnotateTool, ProbeTool, PlanarFreehandROITool]
     .forEach(T => {
       tg.addTool(T.toolName);
@@ -241,7 +242,7 @@ function _createToolGroup(groupId) {
   return tg;
 }
 
-// ─── Phase 3 — MPR / volume tool group (with crosshairs) ───────────────────────
+// --- Phase 3 - MPR / volume tool group (with crosshairs) -----------------------
 function _createMPRToolGroup(groupId) {
   try { ToolGroupManager.destroyToolGroup(groupId); } catch(e) {}
   const tg = ToolGroupManager.createToolGroup(groupId);
@@ -251,13 +252,13 @@ function _createMPRToolGroup(groupId) {
   tg.addTool(ZoomTool.toolName);
   tg.addTool(StackScrollTool.toolName);
 
-  // Same navigation bindings as the rest of the app (master-ref §7 preserved).
+  // Same navigation bindings as the rest of the app (master-ref ?7 preserved).
   tg.setToolActive(PanTool.toolName,         { bindings: [{ mouseButton: MouseBindings.Primary }] });
   tg.setToolActive(ZoomTool.toolName,        { bindings: [{ mouseButton: MouseBindings.Secondary }] });
   tg.setToolActive(StackScrollTool.toolName, { bindings: [{ mouseButton: MouseBindings.Wheel }] });
   tg.setToolActive(WindowLevelTool.toolName, { bindings: [{ mouseButton: MouseBindings.Auxiliary }] });
 
-  // Crosshairs: reference lines coloured per row. Kept DISABLED by default —
+  // Crosshairs: reference lines coloured per row. Kept DISABLED by default -
   // a Passive/Enabled crosshairs runs mouseMoveCallback on every move and throws
   // ("cannot read 'length' of undefined") until its annotation is initialised,
   // which only happens reliably in the ACTIVE mode AFTER volumes are loaded.
@@ -277,9 +278,9 @@ function _createMPRToolGroup(groupId) {
   });
   tg.addTool(CircleROITool.toolName);
   // Draw a new circle: Shift + Right drag.  Move an existing circle: Ctrl + Left
-  // drag (master-ref §7).  Both bindings coexist — CS3D's mouseDown prioritises
+  // drag (master-ref ?7).  Both bindings coexist - CS3D's mouseDown prioritises
   // grabbing an existing annotation under the cursor (filterMoveableAnnotationTools
-  // → our patched isPointNearTool) over starting a new one.
+  // -> our patched isPointNearTool) over starting a new one.
   tg.setToolActive(CircleROITool.toolName, {
     bindings: [
       { mouseButton: MouseBindings.Secondary, modifierKey: KeyboardBindings.Shift },
@@ -302,7 +303,7 @@ function _createMPRToolGroup(groupId) {
 }
 
 // Toggle crosshairs between ACTIVE (click-to-navigate + visible reference lines)
-// and DISABLED (off — no event handling, so no mouseMoveCallback crash). We use
+// and DISABLED (off - no event handling, so no mouseMoveCallback crash). We use
 // DISABLED rather than PASSIVE for the "off" state because PASSIVE still runs the
 // crashing mouseMoveCallback. Used by the toolbar "Crosshair" button.
 export function setCrosshairsActive(active) {
@@ -325,12 +326,12 @@ function _createSynchronizers() {
   });
   synchronizers.createStackImageSynchronizer(SYNC_SCROLL_ID);
 
-  // ── Zoom sync (orientation-safe) ──────────────────────────────────────────
+  // -- Zoom sync (orientation-safe) ------------------------------------------
   // createCameraPositionSynchronizer copies the WHOLE camera, which forces all
-  // viewports to the same orientation — wrong for MPR (axial/coronal/sagittal
+  // viewports to the same orientation - wrong for MPR (axial/coronal/sagittal
   // mixed). This custom synchronizer propagates ONLY the zoom factor
   // (parallelScale), so all 6 planes zoom together while keeping their own
-  // orientation. The epsilon guard prevents an infinite render→sync feedback loop.
+  // orientation. The epsilon guard prevents an infinite render->sync feedback loop.
   SynchronizerManager.createSynchronizer(
     SYNC_ZOOM_ID,
     CoreEnums.Events.CAMERA_MODIFIED,
@@ -345,7 +346,7 @@ function _createSynchronizers() {
         const sScale = sVp.getCamera()?.parallelScale;
         const tScale = tVp.getCamera()?.parallelScale;
         if (sScale == null) return;
-        if (tScale != null && Math.abs(tScale - sScale) < 1e-3) return; // no-op → stop loop
+        if (tScale != null && Math.abs(tScale - sScale) < 1e-3) return; // no-op -> stop loop
         tVp.setCamera({ parallelScale: sScale });
         tVp.render();
       } catch(e) {}
@@ -357,9 +358,9 @@ function _createSynchronizers() {
   synchronizers.createCameraPositionSynchronizer(SYNC_PAN_ID);
 }
 
-// ── Per-viewport ownership filter ─────────────────────────────────────────────
+// -- Per-viewport ownership filter ---------------------------------------------
 // Patches filterInteractableAnnotationsForElement on AnnotationDisplayTool.prototype.
-// Only filters by sourceViewportId. NO geometry injection — handles are drawn
+// Only filters by sourceViewportId. NO geometry injection - handles are drawn
 // separately via the ANNOTATION_RENDERED event in ViewerBox.
 function _patchAnnotationDisplayFilter(AnyConcreteToolClass) {
   try {
@@ -388,7 +389,57 @@ function _patchAnnotationDisplayFilter(AnyConcreteToolClass) {
   }
 }
 
-// ── CircleROI / EllipticalROI interior hit patch ──────────────────────────────
+
+// P2: CircleROI 8 handle dots via prototype getHandles override.
+// CS3D v2 calls proto.getHandles() during render to determine which dots to draw.
+// We return center + 8 rim points. The original annotation.data.handles.points
+// stays [center, edge] so hit-test and link-line geometry are unaffected.
+function _patchCircleHandles(ToolClass) {
+  try {
+    const proto = ToolClass.prototype;
+    if (!proto || proto.__circleHandlesPatched) return;
+    const _orig = proto.getHandles;
+    proto.getHandles = function(annotation) {
+      const original = _orig ? _orig.call(this, annotation) : annotation && annotation.data && annotation.data.handles;
+      try {
+        const points = annotation && annotation.data && annotation.data.handles && annotation.data.handles.points;
+        if (!points || points.length < 2) return original;
+        const center = points[0];
+        const edge   = points[1];
+        const dx = edge[0] - center[0];
+        const dy = edge[1] - center[1];
+        const dz = (edge[2] || 0) - (center[2] || 0);
+        const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (len < 1e-6) return original;
+        const v1x = dx/len, v1y = dy/len, v1z = dz/len;
+        const v2x = -dy/len, v2y = dx/len, v2z = 0;
+        const angles = [0, 45, 90, 135, 180, 225, 270, 315];
+        const rimPoints = angles.map(function(deg) {
+          const rad = deg * Math.PI / 180;
+          const c = Math.cos(rad), s = Math.sin(rad);
+          return [
+            center[0] + len * (c * v1x + s * v2x),
+            center[1] + len * (c * v1y + s * v2y),
+            (center[2] || 0) + len * (c * v1z + s * v2z),
+          ];
+        });
+        return {
+          points: [center].concat(rimPoints),
+          activeHandleIndex: original ? original.activeHandleIndex : null,
+          textBox: original ? original.textBox : undefined,
+        };
+      } catch(e) {
+        return original;
+      }
+    };
+    proto.__circleHandlesPatched = true;
+    console.log('[CS3D] CircleROI 8-handle dots patch applied');
+  } catch(e) {
+    console.warn('[CS3D] _patchCircleHandles failed:', e && e.message);
+  }
+}
+
+// -- CircleROI / EllipticalROI interior hit patch ------------------------------
 // Makes the whole ROI interior draggable for MOVING (v2.1.16 only hits the
 // 3px-wide outline by default). Falls back to the original test on any error.
 function _patchCircleInteriorHit(ToolClass) {
@@ -438,17 +489,17 @@ function _patchCircleInteriorHit(ToolClass) {
   }
 }
 
-// ── CircleROI rim-resize patch ────────────────────────────────────────────────
+// -- CircleROI rim-resize patch ------------------------------------------------
 // v2.1.16 only shows/activates the resize handle when the cursor is within 6px
-// of points[1] — the single spot on the rim where drawing ended. This makes the
+// of points[1] - the single spot on the rim where drawing ended. This makes the
 // handle effectively undiscoverable. This patch activates the resize handle when
-// the cursor is near ANY point of the rim (|dist-to-centre − radius| ≤ 8px):
+// the cursor is near ANY point of the rim (|dist-to-centre ? radius| ? 8px):
 // the handle dot renders (activeHandleIndex set) and dragging resizes.
 function _patchCircleRimResize(ToolClass) {
   try {
     const proto = ToolClass.prototype;
     if (!proto || proto.__rimResizePatched) return;
-    // getHandleNearImagePoint is inherited from AnnotationTool — capture whatever
+    // getHandleNearImagePoint is inherited from AnnotationTool - capture whatever
     // is resolved on this prototype chain so we can fall back to it.
     const original = proto.getHandleNearImagePoint;
     proto.getHandleNearImagePoint = function(element, annotation, canvasCoords, proximity) {

@@ -544,8 +544,7 @@ export default function ViewerBox({
         }
 
         if (needsRender) {
-          // One re-render to apply the corrected position
-          setTimeout(() => { try { vp.render() } catch(e) {} }, 0)
+          requestAnimationFrame(() => { try { vp.render() } catch(e) {} })
         }
 
         // ── Handle overlay ────────────────────────────────────────────────────
