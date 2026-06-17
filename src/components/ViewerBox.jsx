@@ -36,17 +36,6 @@ import {
   WindowLevelTool,
   annotation,
 } from '@cornerstonejs/tools';
-
-function triggerAnnotationRenderForViewportIds(viewportIds) {
-  if (!viewportIds || !viewportIds.length) return;
-  viewportIds.forEach((vid) => {
-    const ee = getEnabledElementByViewportId(vid);
-    if (ee && ee.viewport) {
-      annotation.state.getAnnotationManager();
-      ee.viewport.render();
-    }
-  });
-}
 import {
   RENDERING_ENGINE_ID,
   SYNC_SCROLL_ID, SYNC_ZOOM_ID, SYNC_PAN_ID, SYNC_VIEWPORT_IDS,
@@ -66,6 +55,15 @@ import {
   getOrientationMarkers,
 } from '../utils/volumeManager.js';
 import { applyFusionTransform, resetFusionTransform } from '../utils/fusionManager.js';
+
+// triggerAnnotationRenderForViewportIds polyfill for CS3D v2.1.16
+function triggerAnnotationRenderForViewportIds(viewportIds) {
+  if (!viewportIds || !viewportIds.length) return;
+  viewportIds.forEach((vid) => {
+    const ee = getEnabledElementByViewportId(vid);
+    if (ee && ee.viewport) { ee.viewport.render(); }
+  });
+}
 
 const { ViewportType, Events, OrientationAxis } = CoreEnums;
 const { MouseBindings, KeyboardBindings } = ToolEnums;
@@ -154,9 +152,33 @@ export default function ViewerBox({
   const [showPalMenu, setShowPalMenu] = useState(false);
   const [showPresets, setShowPresets] = useState(false);
   const [sliceInfo, setSliceInfo]     = useState({ current: 0, total: 0 });
+  const [mipPlaying, setMipPlaying]   = useState(false);  // lifted so orientation bar can stop rotation
   const closeTimers = useRef({});
 
   const isVolume = renderMode === 'volume';
+
+  // ── MIP auto-start: begin rotation once camera has a valid focalPoint ──────
+  // Polls every 500ms (max 15s) after mount. Sets mipPlaying=true once the MIP
+  // viewport camera is initialised by applyMIPVolume + zoom-parity sync.
+  useEffect(() => {
+    if (modality !== 'MIP') return
+    let attempts = 0
+    const timer = setInterval(() => {
+      attempts++
+      try {
+        const engine = getRenderingEngine(RENDERING_ENGINE_ID)
+        const vp = engine?.getViewport(viewportId)
+        const cam = vp?.getCamera()
+        // focalPoint is non-zero once applyMIPVolume has run
+        if (cam?.focalPoint && cam.focalPoint.some(v => Math.abs(v) > 0.1)) {
+          clearInterval(timer)
+          setMipPlaying(true)
+        }
+      } catch(e) {}
+      if (attempts >= 30) clearInterval(timer)
+    }, 500)
+    return () => clearInterval(timer)
+  }, [modality, viewportId])
 
   // ── Viewport setup ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -241,6 +263,23 @@ export default function ViewerBox({
           el.addEventListener(Events.IMAGE_RENDERED, syncCameraOnce, { once: true })
         } else { // MIP
           await applyMIPVolume(vp, { petWL: wl, colormapName: `petct_${paletteId}`, orientation });
+
+          // ── MIP zoom parity ───────────────────────────────────────────────
+          // After resetCamera() the MIP shows the patient at the same zoom as
+          // a 1-row coronal, but the MIP box is 2 rows tall — so the patient
+          // only fills the top half with black below. Fix: double parallelScale
+          // so the patient fills the full 2-row height at the same pixel-per-mm
+          // density as the coronal viewports.
+          // Done on first IMAGE_RENDERED (after resetCamera has settled).
+          el.addEventListener(Events.IMAGE_RENDERED, function syncMIPZoomOnce() {
+            el.removeEventListener(Events.IMAGE_RENDERED, syncMIPZoomOnce)
+            try {
+              const cam = vp.getCamera()
+              if (!cam?.parallelScale) return
+              vp.setCamera({ ...cam, parallelScale: cam.parallelScale * 2 })
+              vp.render()
+            } catch(e) {}
+          })
         }
         if (cancelled) return;
         hasVP.current = true;
@@ -362,7 +401,9 @@ export default function ViewerBox({
   // ── PET overlay opacity (fusion blend slider) ─────────────────────────────
   useEffect(() => {
     if (!hasVP.current || !isVolume || modality !== 'PET') return;
-    setPetOpacity(viewportId, petOpacity);
+    // Pass petWL so buildPetOpacityArray can build the correct value-mapped
+    // transfer function (the scalar range depends on the current W/L).
+    setPetOpacity(viewportId, petOpacity, petWLFusion || wl);
   }, [petOpacity]);
 
   // -- Phase 4: apply fusion transform when offset changes (PET viewports only) --
@@ -1071,7 +1112,8 @@ export default function ViewerBox({
   }
 
   // ── Palette helpers ───────────────────────────────────────────────────────
-  const palettes = modality === 'PET' ? PET_PALETTES : CT_PALETTES;
+  const rawPalettes = (modality === 'PET' || modality === 'MIP') ? PET_PALETTES : CT_PALETTES;
+  const palettes    = modality === 'MIP' ? rawPalettes.filter(p => p.group !== 'fmri') : rawPalettes;
   const presets  = modality === 'PET' ? PET_PRESETS  : CT_PRESETS;
 
   const openPal  = () => { clearTimeout(closeTimers.current.pal); setShowPalMenu(true); };
@@ -1206,10 +1248,15 @@ export default function ViewerBox({
       )}
 
       {/* MIP orientation bar — A/P/R/L/H/F buttons, MIP viewport only */}
-      {modality === 'MIP' && <MIPOrientationBar viewportId={viewportId} />}
+      {modality === 'MIP' && (
+        <MIPOrientationBar viewportId={viewportId} onStopRotation={() => setMipPlaying(false)} />
+      )}
 
       {/* Cine controls — bottom of every box */}
-      <CineBar viewportId={viewportId} modality={modality} isMIP={modality === 'MIP'} />
+      <CineBar
+        viewportId={viewportId} modality={modality} isMIP={modality === 'MIP'}
+        mipPlaying={mipPlaying} onMipPlayingChange={setMipPlaying}
+      />
 
       {/* (Removed) auto-appearing "N selected / Delete" toolbar — it popped up
           immediately after every draw. Deletion is now via right-click on the
@@ -1390,9 +1437,14 @@ function _applyProps(vp, wl, paletteId) {
 //   We use setInterval at the chosen fps and call vp.scroll(1) which works
 //   for both STACK (stackScroll moves slice index) and ORTHOGRAPHIC volume
 //   (stackScroll advances the slab position on the current axis).
-function CineBar({ viewportId, modality, isMIP }) {
-  const [playing, setPlaying]   = useState(false)
-  const [fps, setFps]           = useState(isMIP ? 6 : 8)
+function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }) {
+  // MIP: playing state is lifted to ViewerBox so orientation bar can stop it.
+  // Non-MIP: local state.
+  const [localPlaying, setLocalPlaying] = useState(false)
+  const playing    = isMIP ? (mipPlaying ?? false)      : localPlaying
+  const setPlaying = isMIP ? (onMipPlayingChange ?? (() => {})) : setLocalPlaying
+
+  const [fps, setFps]           = useState(isMIP ? 30 : 8)
   const rAFRef   = useRef(null)   // rAF id for MIP rotation
   const timerRef = useRef(null)   // setInterval id for slice scroll
   const angleRef = useRef(0)      // current rotation angle in degrees (MIP)
@@ -1463,15 +1515,9 @@ function CineBar({ viewportId, modality, isMIP }) {
 
     function loop(ts) {
       if (!playingRef.current) return
-      // Throttle to chosen rpm converted to degrees-per-frame.
-      // fpsRef.current here is actually "rpm" for MIP but we use the same slider.
-      // At fps=6: 6 rev/min = 0.1 rev/s = 36 deg/s.
-      const interval = 1000 / Math.max(1, fpsRef.current) // ms between steps
-      if (ts - last >= interval) {
-        // degrees per step: one full revolution spread across 120 steps (smooth)
-        _stepMIP(3)   // 3 degrees per step ≈ 120 steps for full rotation
-        last = ts
-      }
+      // degrees/frame = rpm × 360° / 60sec / 60fps = rpm × 0.1
+      // At rpm=30: 3°/frame → 1 rev in 2s. At rpm=70: 7°/frame → 1 rev in 0.86s.
+      _stepMIP(fpsRef.current * 0.1)
       rAFRef.current = requestAnimationFrame(loop)
     }
     rAFRef.current = requestAnimationFrame(loop)
@@ -1578,7 +1624,9 @@ function CineBar({ viewportId, modality, isMIP }) {
         {isMIP ? 'rpm' : 'fps'}
       </span>
       <input
-        type="range" min={1} max={30} value={fps}
+        type="range"
+        min={isMIP ? 20 : 1} max={isMIP ? 70 : 30} step={isMIP ? 10 : 1}
+        value={fps}
         onChange={e => setFps(+e.target.value)}
         onMouseDown={e => e.stopPropagation()}
         style={{ width: 44, accentColor: isMIP ? '#336699' : '#00e5ff', height: 3 }}
@@ -1619,10 +1667,12 @@ const MIP_VIEWS = [
   { id: 'F', label: 'F',  title: 'Foot (Caudal)', pos: [0, 0, -1], up: [0, 1, 0] },
 ]
 
-function MIPOrientationBar({ viewportId }) {
+function MIPOrientationBar({ viewportId, onStopRotation }) {
   const [activeView, setActiveView] = useState('A')
 
   function _applyView(view) {
+    // Stop rotation first so rAF loop doesn't overwrite our camera position
+    onStopRotation?.()
     try {
       const engine = getRenderingEngine(RENDERING_ENGINE_ID)
       const vp = engine?.getViewport(viewportId)
@@ -1632,6 +1682,9 @@ function MIPOrientationBar({ viewportId }) {
       if (!cam?.focalPoint) return
 
       const fp = cam.focalPoint
+      // Preserve current zoom. NEVER call resetCamera() — it discards user zoom.
+      const parallelScale = cam.parallelScale
+
       // Compute current orbit radius (distance from camera to focal point).
       const dist = Math.hypot(
         cam.position[0] - fp[0],
@@ -1646,14 +1699,7 @@ function MIPOrientationBar({ viewportId }) {
         fp[2] + view.pos[2] * dist,
       ]
 
-      // Set position + viewUp first so resetCamera() inherits the correct orientation.
-      vp.setCamera({
-        position:   newPos,
-        focalPoint: fp,
-        viewUp:     view.up,
-      })
-      // resetCamera() refits parallelScale to show the whole volume.
-      vp.resetCamera()
+      vp.setCamera({ position: newPos, focalPoint: fp, viewUp: view.up, parallelScale })
       vp.render()
       setActiveView(view.id)
     } catch(e) {

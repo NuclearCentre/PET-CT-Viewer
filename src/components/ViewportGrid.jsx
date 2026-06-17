@@ -156,11 +156,17 @@ export default function ViewportGrid({
     loadSeries();
   }, [studyUID]);
 
-  // ── Camera sync fallback: belt-and-suspenders for CT/PET size parity ────────
-  // ViewerBox.jsx does the primary sync via a one-shot IMAGE_RENDERED listener
-  // on each PET viewport (fires after the first render, after resetCamera settles).
-  // This fallback runs at 500ms — by then both CT and PET viewports have rendered
-  // at least once and their cameras are stable.
+  // ── Camera sync: CT/PET size parity + MIP zoom ───────────────────────────
+  // Runs at 500ms after volumesReady -- by then all viewports have rendered once
+  // and cameras are stable after resetCamera().
+  //
+  // CT/PET pairs: copies parallelScale from CT to matching PET-CT viewport.
+  //
+  // MIP zoom: applyMIPVolume resetCamera() fits PET volume into the 2-row MIP box,
+  // giving a different parallelScale than 1-row coronal viewports.
+  // Fix: set MIP parallelScale = ct-coronal parallelScale (same anatomical zoom).
+  // VTK parallelScale = half the visible height in world units. The MIP box is
+  // 2x taller but we override the scale to match coronal magnification directly.
   useEffect(() => {
     if (!volumesReady) return;
     const pairs = [
@@ -172,6 +178,8 @@ export default function ViewportGrid({
       try {
         const engine = getRenderingEngine(RENDERING_ENGINE_ID);
         if (!engine) return;
+
+        // CT/PET size parity
         for (const [ctId, petId] of pairs) {
           const ctVp  = engine.getViewport(ctId);
           const petVp = engine.getViewport(petId);
@@ -179,12 +187,27 @@ export default function ViewportGrid({
           const ctCam  = ctVp.getCamera();
           if (!ctCam?.parallelScale) continue;
           const petCam = petVp.getCamera();
-          // Only apply if parallelScale still differs (primary sync may have already fixed it)
           if (Math.abs((petCam?.parallelScale || 0) - ctCam.parallelScale) > 0.01) {
             petVp.setCamera({ ...petCam, parallelScale: ctCam.parallelScale });
             petVp.render();
           }
         }
+
+        // MIP zoom: match ct-coronal anatomical magnification
+        const ctCorVp = engine.getViewport('ct-coronal');
+        const mipVp   = engine.getViewport('mip');
+        if (ctCorVp && mipVp) {
+          const ctCorCam = ctCorVp.getCamera();
+          const mipCam   = mipVp.getCamera();
+          if (ctCorCam?.parallelScale && mipCam) {
+            const targetScale = ctCorCam.parallelScale;
+            if (Math.abs((mipCam.parallelScale || 0) - targetScale) > 0.01) {
+              mipVp.setCamera({ ...mipCam, parallelScale: targetScale });
+              mipVp.render();
+            }
+          }
+        }
+
       } catch(e) {}
     }, 500);
     return () => clearTimeout(timer);

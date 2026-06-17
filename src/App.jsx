@@ -703,15 +703,9 @@ function Ribbon({
       {/* Cine card */}
       <RibbonCard label="Cine" color="#aa8855">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-            <span style={{ fontSize: 8, color: '#664422', minWidth: 46 }}>Slice fps</span>
-            <input type="range" min={1} max={30} defaultValue={8}
-              style={{ width: 60, accentColor: '#886633' }} />
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-            <span style={{ fontSize: 8, color: '#664422', minWidth: 46 }}>MIP rpm</span>
-            <input type="range" min={1} max={30} defaultValue={6}
-              style={{ width: 60, accentColor: '#886633' }} />
+          <div style={{ fontSize: 8, color: '#664422', lineHeight: 1.5 }}>
+            Slice fps &amp; MIP rpm<br/>
+            <span style={{ color: '#888' }}>controlled per-viewport<br/>via cine bar below each image</span>
           </div>
         </div>
       </RibbonCard>
