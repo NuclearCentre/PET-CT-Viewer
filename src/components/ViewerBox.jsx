@@ -34,6 +34,7 @@ import {
   ZoomTool,
   WindowLevelTool,
   annotation,
+  triggerAnnotationRenderForViewportIds,
 } from '@cornerstonejs/tools';
 import {
   RENDERING_ENGINE_ID,
@@ -132,7 +133,8 @@ export default function ViewerBox({
   petWLFusion,                   // PET overlay W/L for fusion viewports
 }) {
   const divRef      = useRef(null);
-  const hasVP       = useRef(false);
+  const hasVP          = useRef(false);
+  const cameraSyncedRef = useRef(false);  // one-shot flag for PET↔CT camera sync
   const [paletteId, setPaletteId]     = useState(DEFAULT_COLORMAP[modality] || 'gray');
   const [showPalMenu, setShowPalMenu] = useState(false);
   const [showPresets, setShowPresets] = useState(false);
@@ -190,6 +192,38 @@ export default function ViewerBox({
             petColormapName: `petct_${paletteId}`,
             petOpacity,
           });
+          // ── CT/PET size parity ─────────────────────────────────────────────
+          // applyCTVolume and applyFusionVolumes each call resetCamera() which
+          // fits the volume to the viewport. CT (600 slices, large FOV) and PET
+          // (200 slices, smaller FOV) end up at different parallelScale values
+          // → images appear different sizes.
+          //
+          // Fix: after the PET viewport's FIRST IMAGE_RENDERED (guarantees
+          // applyCTVolume/applyFusionVolumes and their resetCamera() calls have
+          // both completed), read the matching CT viewport's parallelScale and
+          // apply it here. parallelScale only — position/focalPoint stay
+          // independent so each plane shows the correct anatomy centre.
+          //
+          // cameraSyncedRef prevents this from running on every scroll render.
+          // It resets to false in the useEffect cleanup so a re-mount re-syncs.
+          cameraSyncedRef.current = false
+          const syncCameraOnce = () => {
+            if (cameraSyncedRef.current || cancelled) return
+            cameraSyncedRef.current = true
+            try {
+              const engine = getRenderingEngine(RENDERING_ENGINE_ID)
+              // pct-axial → ct-axial, pct-coronal → ct-coronal, pct-sagittal → ct-sagittal
+              const ctId = viewportId.replace(/^pct-/, 'ct-')
+              const ctVp = engine?.getViewport(ctId)
+              if (!ctVp) return
+              const ctCam  = ctVp.getCamera()
+              if (!ctCam?.parallelScale) return
+              const ourCam = vp.getCamera()
+              vp.setCamera({ ...ourCam, parallelScale: ctCam.parallelScale })
+              vp.render()
+            } catch(e) {}
+          }
+          el.addEventListener(Events.IMAGE_RENDERED, syncCameraOnce, { once: true })
         } else { // MIP
           await applyMIPVolume(vp, { petWL: wl, colormapName: `petct_${paletteId}`, orientation });
         }
@@ -249,6 +283,7 @@ export default function ViewerBox({
 
     return () => {
       cancelled = true;
+      cameraSyncedRef.current = false;
       ro.disconnect();
       if (SYNC_VIEWPORT_IDS.includes(viewportId)) {
         removeViewportFromSync(SYNC_SCROLL_ID, viewportId);
@@ -436,48 +471,83 @@ export default function ViewerBox({
         if (!ann || !vid) return
         if (vid !== viewportId) return
         ann.metadata.sourceViewportId = viewportId
-        console.log(`[ViewerBox] tagged annotation to ${viewportId}`)
 
-        // Pre-position the textbox ABOVE the annotation center rather than
-        // to the right (CS3D default via getTextBoxCoordsCanvas places it at
-        // the rightmost point, which overflows on right-edge annotations).
-        // Setting hasMoved=true makes CS3D use worldPosition directly.
-        try {
-          const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(vid)
-          if (vp && ann.data?.handles) {
-            const pts = ann.data.handles.points
-            const center = pts?.[0] || [0, 0, 0]
-            // Place text above-left of center in canvas space, then convert
-            const cv = vp.worldToCanvas(center)
-            const el = divRef.current
-            const W = el?.clientWidth  || 400
-            const H = el?.clientHeight || 400
-            const TW = 180, TH = 110  // conservative text box dimensions
-            // Try above the annotation first; if not enough room, try right
-            let tx = Math.min(cv[0] - TW / 2, W - TW - 8)
-            tx = Math.max(8, tx)
-            let ty = cv[1] - TH - 40
-            if (ty < 8) ty = cv[1] + 40  // flip below if not enough room above
-            ty = Math.max(8, Math.min(ty, H - TH - 8))
-            ann.data.handles.textBox.worldPosition = vp.canvasToWorld([tx, ty])
-            ann.data.handles.textBox.hasMoved = true
-          }
-        } catch(e) {}
+        // SUV ROI propagation rule (mirrors CT VOI across all 3 CT planes):
+        // A CircleROI (or any ROI) drawn on a PET-CT fused viewport is tagged
+        // rowShared=true + viewportRow='pct'. The annotation display filter in
+        // cornerstone-init.js lets through any annotation whose viewportRow
+        // matches the current viewport's row, so it renders in all 3 PET-CT
+        // planes (axial, coronal, sagittal) with per-plane stats.
+        // CT viewports are left exclusive (sourceViewportId only) per Rule 13.
+        const isPCT = viewportId.startsWith('pct-')
+        if (isPCT) {
+          ann.metadata.rowShared   = true
+          ann.metadata.viewportRow = 'pct'
+        }
+
+        console.log(`[ViewerBox] tagged annotation to ${viewportId}${isPCT ? ' (row-shared pct)' : ''}`)
+
+        // Do NOT pre-position the textbox here. CS3D's getTextBoxCoordsCanvas
+        // places text at the rightmost annotation point + 25px, which is
+        // ADJACENT to the annotation with zero gap in the link line.
+        // The ANNOTATION_RENDERED handler below clamps it into the safe zone
+        // if it overflows a viewport edge — without introducing an artificial gap.
       } catch(e) {}
     }
 
     function onCompleted(evt) {
       setDrawingComplete(true)
-      // Force stats recalculation — needed when ROI drawn before volume streams
+      // Force stats recalculation with retry.
+      // Root cause: CS3D's _calculateCachedStats silently skips when
+      // getTargetImageData() returns null — the volume slice containing this
+      // ROI hasn't streamed yet. We poll until stats appear.
+      //
+      // Uses triggerAnnotationRenderForViewportIds (CS3D's own API) instead of
+      // vp.render() — this specifically re-runs renderAnnotation on every tool,
+      // which calls _calculateCachedStats for any annotation with invalidated=true.
+      // Plain vp.render() can skip annotation re-rendering in some CS3D code paths.
+      //
+      // 8 retries × 500ms = 4 seconds total coverage (handles slow networks /
+      // large PET volumes where the specific slice may take time to stream).
+      //
+      // Row-shared PET-CT ROIs: trigger all 3 pct- viewports so each plane
+      // computes its own cachedStats for the correct slice it is showing.
       try {
         const ann = evt?.detail?.annotation
-        if (ann) {
-          ann.invalidated = true
-          setTimeout(() => {
-            try { getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)?.render() }
-            catch(e) {}
-          }, 150)
+        if (!ann) return
+        ann.invalidated = true
+
+        // Build the list of viewports to trigger.
+        // If this is a row-shared pct annotation, include all pct- viewports
+        // so every plane gets its own stats (axial SUV ≠ coronal SUV because
+        // each plane intersects the ROI at a different depth through the volume).
+        const isRowShared = ann.metadata?.rowShared && ann.metadata?.viewportRow === 'pct'
+        const triggerIds = isRowShared
+          ? ['pct-axial', 'pct-coronal', 'pct-sagittal']
+          : [viewportId]
+
+        let attempts = 0
+        const tryRender = () => {
+          attempts++
+          try {
+            const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)
+            if (!vp) return
+            ann.invalidated = true
+            try {
+              triggerAnnotationRenderForViewportIds(triggerIds)
+            } catch(e) {
+              vp.render()  // fallback if the API throws
+            }
+            // Check if stats have landed
+            const stats = ann.data?.cachedStats
+            const hasStats = stats && Object.keys(stats).length > 0 &&
+              Object.values(stats).some(v => v && typeof v === 'object' && v.mean != null)
+            if (!hasStats && attempts < 8) {
+              setTimeout(tryRender, 500)
+            }
+          } catch(e) {}
         }
+        setTimeout(tryRender, 200)
       } catch(e) {}
     }
 
@@ -489,65 +559,174 @@ export default function ViewerBox({
     }
   }, [viewportId])
 
+  // ── Volume-loaded fallback for missing stats ──────────────────────────────
+  // IMAGE_VOLUME_LOADING_COMPLETE fires once when the full volume has finished
+  // streaming. Any ROI drawn during streaming whose poll window (4s) expired
+  // before its slice loaded will have null cachedStats. This handler finds all
+  // such annotations owned by this viewport and triggers one final render.
+  useEffect(() => {
+    const VOLUME_LOADED = CoreEnums.Events.IMAGE_VOLUME_LOADING_COMPLETE
+    if (!VOLUME_LOADED) return  // guard: older CS3D versions
+
+    function onVolumeLoaded() {
+      try {
+        const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)
+        if (!vp) return
+        const all = annotation.state.getAllAnnotations() || []
+        const needsStats = all.some(ann => {
+          if (ann.metadata?.sourceViewportId !== viewportId) return false
+          const stats = ann.data?.cachedStats
+          // Has no stats or all stat objects are empty
+          return !stats || Object.keys(stats).length === 0 ||
+            !Object.values(stats).some(v => v && typeof v === 'object' && v.mean != null)
+        })
+        if (!needsStats) return
+        // Invalidate all stat-missing annotations and trigger a render
+        all.forEach(ann => {
+          if (ann.metadata?.sourceViewportId !== viewportId) return
+          const stats = ann.data?.cachedStats
+          const missing = !stats || Object.keys(stats).length === 0 ||
+            !Object.values(stats).some(v => v && typeof v === 'object' && v.mean != null)
+          if (missing) ann.invalidated = true
+        })
+        try {
+          triggerAnnotationRenderForViewportIds([viewportId])
+        } catch(e) {
+          try { vp.render() } catch(e2) {}
+        }
+      } catch(e) {}
+    }
+
+    eventTarget.addEventListener(VOLUME_LOADED, onVolumeLoaded)
+    return () => eventTarget.removeEventListener(VOLUME_LOADED, onVolumeLoaded)
+  }, [viewportId])
+
+  // ── Textbox safe-zone clamping ────────────────────────────────────────────
+  // _clampAllTextboxes reads worldBoundingBox (set by CS3D during the preceding
+  // render) for every annotation owned by this viewport, computes how far the
+  // box is outside the safe zone, and shifts worldPosition by that amount.
+  // hasMoved=true makes CS3D use our corrected position on the next render.
+  //
+  // Called from THREE places so the clamp fires reliably:
+  //   1. ANNOTATION_RENDERED — after every repaint (handles resize/scroll)
+  //   2. pointerup at t=0ms — immediately after user releases textbox drag
+  //   3. pointerup at t=150ms — belt-and-suspenders after CS3D settles
+  //
+  // Why pointerup is needed: ANNOTATION_RENDERED fires during the render cycle
+  // and worldBoundingBox may be from the PREVIOUS frame when it fires. After
+  // pointerup CS3D has committed the final dragged position to worldBoundingBox,
+  // so our clamp reads the true out-of-bounds position and corrects it.
+  const _clampAllTextboxes = useCallback(() => {
+    try {
+      const el = divRef.current
+      if (!el) return
+      const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)
+      if (!vp) return
+      const W = el.clientWidth
+      const H = el.clientHeight
+      // Safe-zone margins (accounts for UI chrome overlaid on the CS3D canvas):
+      //   PL=8   left
+      //   PR=30  right: 22px colormap strip + 8px margin
+      //   PT=22  top: ~20px label bar + 2px
+      //   PB=28  bottom: ~20px slice/info bar + 8px
+      const PL = 8, PR = 30, PT = 22, PB = 28
+      const safeW = W - PL - PR
+      const safeH = H - PT - PB
+
+      const all = annotation.state.getAllAnnotations()
+      let needsRender = false
+
+      for (const ann of (all || [])) {
+        // Clamp textboxes for annotations that belong to this viewport
+        // (either exclusively via sourceViewportId, or row-shared SUV ROIs
+        //  that are being displayed here because viewportRow matches).
+        const src = ann.metadata?.sourceViewportId
+        const rowShared = ann.metadata?.rowShared
+        const inRow = ann.metadata?.viewportRow
+        const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
+        const belongsHere = src === viewportId || (rowShared && inRow && inRow === myRow)
+        if (!belongsHere) continue
+
+        const tb = ann.data?.handles?.textBox
+        if (!tb) continue
+
+        const wb = tb.worldBoundingBox
+        if (!wb?.topLeft || !wb?.topRight || !wb?.bottomLeft || !wb?.bottomRight) continue
+        try {
+          // Project all 4 corners to canvas and take min/max.
+          // worldToCanvas can flip axes in MPR orientations so wb.topLeft does NOT
+          // reliably project to the canvas top-left corner. min/max is always correct.
+          const cvCorners = [wb.topLeft, wb.topRight, wb.bottomLeft, wb.bottomRight]
+            .map(w => vp.worldToCanvas(w))
+          const xs     = cvCorners.map(c => c[0])
+          const ys     = cvCorners.map(c => c[1])
+          const left   = Math.min(...xs), right  = Math.max(...xs)
+          const top    = Math.min(...ys), bottom = Math.max(...ys)
+          const boxW   = right - left
+          const boxH   = bottom - top
+          const pos    = vp.worldToCanvas(tb.worldPosition)
+
+          // Shift = how much the box edge needs to move to reach the safe boundary.
+          // Applied to pos (worldPosition anchor) so the whole box moves by exactly that amount.
+          let sx = 0, sy = 0
+          if (boxW <= safeW) {
+            if (right  > W - PR) sx = (W - PR - boxW) - left
+            if (left   < PL)     sx = PL - left
+          } else {
+            sx = PL - left  // box wider than safe zone: pin to left edge
+          }
+          if (boxH <= safeH) {
+            if (bottom > H - PB) sy = (H - PB - boxH) - top
+            if (top    < PT)     sy = PT - top
+          } else {
+            sy = PT - top  // box taller than safe zone: pin to top edge
+          }
+
+          if (sx !== 0 || sy !== 0) {
+            tb.worldPosition = vp.canvasToWorld([pos[0] + sx, pos[1] + sy])
+            tb.hasMoved = true
+            needsRender = true
+          }
+        } catch(e) {}
+      }
+
+      if (needsRender) {
+        // CRITICAL: use triggerAnnotationRenderForViewportIds, NOT vp.render().
+        // vp.render() in CS3D v2.1.16 does NOT always re-run renderAnnotation,
+        // so the corrected worldPosition (set above) is never applied visually.
+        // triggerAnnotationRenderForViewportIds forces a full re-run of every
+        // tool's renderAnnotation on this viewport, which reads the new worldPosition.
+        try {
+          triggerAnnotationRenderForViewportIds([viewportId])
+        } catch(e) {
+          try { vp.render() } catch(e2) {}
+        }
+      }
+    } catch(e) {}
+  }, [viewportId])
+
   // ── ANNOTATION_RENDERED: clamp textbox + draw handle dots ─────────────────
   // Fires after every SVG annotation repaint with current canvas coordinates.
-  // 1) Reads the REAL textbox bounding box (worldBoundingBox) that CS3D sets
-  //    after drawLinkedTextBoxSvg, converts corners to canvas, and if any
-  //    corner is outside the viewport, shifts worldPosition to bring it in.
-  //    hasMoved=true ensures CS3D uses our position on the next render.
-  // 2) Draws permanent handle dots for CircleROI/EllipticalROI.
   useEffect(() => {
     const RENDERED = 'CORNERSTONE_TOOLS_ANNOTATION_RENDERED'
 
     function onAnnotationRendered(evt) {
       if (evt.detail?.viewportId !== viewportId) return
+      // 1) Clamp all textboxes into the safe zone.
+      _clampAllTextboxes()
+
+      // 2) Draw handle dots for ROI tools.
       try {
         const el = divRef.current
         if (!el) return
         const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)
         if (!vp) return
-        const W = el.clientWidth
-        const H = el.clientHeight
-        const PAD = 8
-
-        const all = annotation.state.getAllAnnotations()
-        let needsRender = false
-
-        for (const ann of (all || [])) {
-          if (ann.metadata?.sourceViewportId !== viewportId) continue
-          const tb = ann.data?.handles?.textBox
-          if (!tb) continue
-
-          // Use worldBoundingBox (set by CS3D after actual draw) for real dims
-          const wb = tb.worldBoundingBox
-          if (wb?.topLeft && wb?.topRight && wb?.bottomLeft && wb?.bottomRight) {
-            try {
-              const tl = vp.worldToCanvas(wb.topLeft)
-              const br = vp.worldToCanvas(wb.bottomRight)
-              const boxW = Math.abs(br[0] - tl[0])
-              const boxH = Math.abs(br[1] - tl[1])
-              const pos  = vp.worldToCanvas(tb.worldPosition)
-
-              let nx = pos[0], ny = pos[1], moved = false
-              if (nx + boxW > W - PAD) { nx = W - boxW - PAD; moved = true }
-              if (nx < PAD)            { nx = PAD;             moved = true }
-              if (ny + boxH > H - PAD) { ny = H - boxH - PAD; moved = true }
-              if (ny < PAD)            { ny = PAD;             moved = true }
-
-              if (moved) {
-                tb.worldPosition = vp.canvasToWorld([nx, ny])
-                tb.hasMoved = true
-                needsRender = true
-              }
-            } catch(e) {}
-          }
-        }
-
-        if (needsRender) {
-          requestAnimationFrame(() => { try { vp.render() } catch(e) {} })
-        }
 
         // ── Handle overlay ────────────────────────────────────────────────────
+        // CS3D draws its own native <circle class="handle"> dots at the raw
+        // points[] positions (2 for Circle, 4 for Ellipse, 2 for Rect).
+        // We want richer geometry. Hide CS3D's dots per annotation UID (scoped —
+        // LengthTool / Arrow etc. keep their own dots), then draw ours.
         const svgLayer = el.querySelector('div.viewport-element > svg.svg-layer')
         if (!svgLayer) return
         svgLayer.querySelector('#handle-overlay')?.remove()
@@ -555,13 +734,27 @@ export default function ViewerBox({
         const g = document.createElementNS(svgns, 'g')
         g.setAttribute('id', 'handle-overlay')
 
+        const OVERLAY_TOOLS = ['CircleROI', 'EllipticalROI', 'RectangleROI']
+        const all = annotation.state.getAllAnnotations()
+        const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
+
         for (const ann of (all || [])) {
-          if (ann.metadata?.sourceViewportId !== viewportId) continue
+          // Draw handles for annotations that belong to this viewport either
+          // exclusively (sourceViewportId) or as row-shared (viewportRow matches).
+          const src = ann.metadata?.sourceViewportId
+          const rowShared = ann.metadata?.rowShared && ann.metadata?.viewportRow === myRow
+          if (src !== viewportId && !rowShared) continue
           if (!annotation.visibility.isAnnotationVisible(ann.annotationUID)) continue
           const toolName = ann.metadata?.toolName || ''
-          if (!['CircleROI', 'EllipticalROI'].includes(toolName)) continue
+          if (!OVERLAY_TOOLS.includes(toolName)) continue
           const pts = ann.data?.handles?.points
           if (!pts || pts.length < 2) continue
+
+          // Hide CS3D's native handle dots for this annotation only.
+          try {
+            svgLayer.querySelectorAll(`[data-id="${ann.annotationUID}"] circle.handle`)
+              .forEach(c => { c.style.display = 'none' })
+          } catch(e) {}
 
           const addDot = (wp, r, fill) => {
             try {
@@ -569,7 +762,7 @@ export default function ViewerBox({
               const dot = document.createElementNS(svgns, 'circle')
               dot.setAttribute('cx', String(Math.round(cv[0])))
               dot.setAttribute('cy', String(Math.round(cv[1])))
-              dot.setAttribute('r', String(r))
+              dot.setAttribute('r',  String(r))
               dot.setAttribute('fill', fill)
               dot.setAttribute('stroke', '#000')
               dot.setAttribute('stroke-width', '1')
@@ -578,25 +771,60 @@ export default function ViewerBox({
             } catch(e) {}
           }
 
-          addDot(pts[0], 5, 'rgba(0,220,255,0.9)')  // center — cyan
-          const c = pts[0], rim = pts[1]
-          const rad = Math.hypot(rim[0]-c[0], rim[1]-c[1], (rim[2]||0)-(c[2]||0))
-          ;[
-            rim,
-            [c[0],       c[1]+rad, c[2]||0],
-            [c[0]+rad,   c[1],     c[2]||0],
-            [c[0],       c[1]-rad, c[2]||0],
-            [c[0]-rad,   c[1],     c[2]||0],
-          ].forEach(wp => addDot(wp, 4, 'rgba(255,222,0,0.85)'))
+          if (toolName === 'CircleROI') {
+            // Canvas-space rim dots — correct for all MPR orientations.
+            const c_cv   = vp.worldToCanvas(pts[0])
+            const rim_cv = vp.worldToCanvas(pts[1])
+            const r_px   = Math.hypot(rim_cv[0]-c_cv[0], rim_cv[1]-c_cv[1])
+            addDot(pts[0], 5, 'rgba(0,220,255,0.9)')  // center cyan
+            ;[0,45,90,135,180,225,270,315].forEach(deg => {
+              const a = deg * Math.PI / 180
+              const dot_cv = [c_cv[0] + r_px*Math.cos(a), c_cv[1] + r_px*Math.sin(a)]
+              try { addDot(vp.canvasToWorld(dot_cv), 4, 'rgba(255,222,0,0.85)') } catch(e) {}
+            })
+
+          } else if (toolName === 'EllipticalROI') {
+            pts.forEach(wp => addDot(wp, 4, 'rgba(255,222,0,0.85)'))
+
+          } else if (toolName === 'RectangleROI') {
+            const p0=pts[0], p1=pts[1]
+            const x1=p0[0], y1=p0[1], z1=p0[2]||0
+            const x2=p1[0], y2=p1[1], z2=p1[2]||0, mz=(z1+z2)/2
+            ;[
+              [x1,y1,z1],[x2,y1,z1],[x2,y2,z2],[x1,y2,z2],
+              [(x1+x2)/2,y1,mz],[x2,(y1+y2)/2,mz],
+              [(x1+x2)/2,y2,mz],[x1,(y1+y2)/2,mz],
+            ].forEach(wp => addDot(wp, 4, 'rgba(255,222,0,0.85)'))
+          }
         }
 
         if (g.childNodes.length) svgLayer.appendChild(g)
       } catch(e) {}
     }
 
+    const MODIFIED = 'CORNERSTONE_TOOLS_ANNOTATION_MODIFIED'
+
+    // Register clamp on every repaint and on annotation data changes
     eventTarget.addEventListener(RENDERED, onAnnotationRendered)
-    return () => eventTarget.removeEventListener(RENDERED, onAnnotationRendered)
-  }, [viewportId])
+    eventTarget.addEventListener(MODIFIED, onAnnotationRendered)
+
+    // pointerup backstop: fires after user releases a textbox drag.
+    // By t=0ms CS3D has committed the dragged worldPosition; by t=150ms
+    // it has definitely also set worldBoundingBox to the dragged position.
+    // Both calls together guarantee the clamp fires with current data.
+    const el = divRef.current
+    const onPointerUp = () => {
+      setTimeout(_clampAllTextboxes, 0)
+      setTimeout(_clampAllTextboxes, 150)
+    }
+    if (el) el.addEventListener('pointerup', onPointerUp)
+
+    return () => {
+      eventTarget.removeEventListener(RENDERED, onAnnotationRendered)
+      eventTarget.removeEventListener(MODIFIED, onAnnotationRendered)
+      if (el) el.removeEventListener('pointerup', onPointerUp)
+    }
+  }, [viewportId, _clampAllTextboxes])
 
   function _applyViewportVisibility() {
     // VOLUME / MPR mode: do NOT touch annotation visibility. CS3D's annotation
@@ -613,8 +841,19 @@ export default function ViewerBox({
       all.forEach(ann => {
         const src = ann.metadata?.sourceViewportId
         if (!src) return // untagged — don't touch
-        const shouldShow = src === viewportId
-        const currently  = annotation.visibility.isAnnotationVisible(ann.annotationUID)
+
+        let shouldShow
+        if (ann.metadata?.rowShared && ann.metadata?.viewportRow) {
+          // Row-shared annotation: visible on all viewports in the same row.
+          // (In stack mode this keeps the annotation visible on its source viewport;
+          //  volume mode handles row visibility via filterInteractableAnnotationsForElement.)
+          const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
+          shouldShow = myRow === ann.metadata.viewportRow
+        } else {
+          shouldShow = src === viewportId
+        }
+
+        const currently = annotation.visibility.isAnnotationVisible(ann.annotationUID)
         if (shouldShow !== currently) {
           annotation.visibility.setAnnotationVisibility(ann.annotationUID, shouldShow)
           changed = true
@@ -743,7 +982,7 @@ export default function ViewerBox({
           if (d < bestDist) { bestDist = d; best = ann; }
         }
       }
-      return bestDist <= 30 ? best : null;
+      return bestDist <= 50 ? best : null;
     } catch(e) { return null; }
   }
 
@@ -763,10 +1002,13 @@ export default function ViewerBox({
     try {
       const all = annotation.state.getAllAnnotations()
       if (!all?.length) return
-      // Only remove annotations tagged to this viewport
+      const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
       all.forEach(ann => {
         const src = ann.metadata?.sourceViewportId
-        if (!src || src === viewportId) {
+        const rowShared = ann.metadata?.rowShared && ann.metadata?.viewportRow === myRow
+        // Remove if tagged to this viewport directly, or row-shared to this row.
+        // (Row-shared: single annotation object, removing it clears all pct- planes.)
+        if (!src || src === viewportId || rowShared) {
           annotation.state.removeAnnotation(ann.annotationUID)
         }
       })
@@ -914,8 +1156,11 @@ export default function ViewerBox({
         <OpacityHandle opacity={petOpacity} onChange={onOpacity} />
       )}
 
+      {/* MIP orientation bar — A/P/R/L/H/F buttons, MIP viewport only */}
+      {modality === 'MIP' && <MIPOrientationBar viewportId={viewportId} />}
+
       {/* Cine controls — bottom of every box */}
-      <CineBar modality={modality} />
+      <CineBar viewportId={viewportId} modality={modality} isMIP={modality === 'MIP'} />
 
       {/* (Removed) auto-appearing "N selected / Delete" toolbar — it popped up
           immediately after every draw. Deletion is now via right-click on the
@@ -1009,24 +1254,158 @@ function _applyProps(vp, wl, paletteId) {
 }
 
 // ─── Cine bar — bottom of every viewport ─────────────────────────────────────
-function CineBar({ modality }) {
-  const [playing, setPlaying] = useState(false)
-  const [fps, setFps]         = useState(8)
+// For non-MIP viewports: cycles through slices (scroll cine).
+// For MIP viewport: rotates the camera around the Z-axis (360° rotation).
+//
+// MIP rotation strategy (Rule 12):
+//   The MIP is a volume viewport (ORTHOGRAPHIC + MAXIMUM_INTENSITY_BLEND).
+//   We store a rotation angle in degrees and advance it each rAF frame.
+//   setCamera({ viewUp, position }) changes the projection direction.
+//   We keep the focal point at the volume centre and orbit the camera
+//   at a fixed radius around the IS (Z) axis, matching clinical convention
+//   where the patient rotates left→right in the coronal plane.
+//
+// Slice scroll cine for non-MIP (stack and volume modes):
+//   We use setInterval at the chosen fps and call vp.scroll(1) which works
+//   for both STACK (stackScroll moves slice index) and ORTHOGRAPHIC volume
+//   (stackScroll advances the slab position on the current axis).
+function CineBar({ viewportId, modality, isMIP }) {
+  const [playing, setPlaying]   = useState(false)
+  const [fps, setFps]           = useState(isMIP ? 6 : 8)
+  const rAFRef   = useRef(null)   // rAF id for MIP rotation
+  const timerRef = useRef(null)   // setInterval id for slice scroll
+  const angleRef = useRef(0)      // current rotation angle in degrees (MIP)
+  // Track playing in a ref so the rAF closure always sees the latest value
+  const playingRef = useRef(false)
+
+  // ── Step: advance by one unit (slice or MIP angle step) ──────────────────
+  function _stepMIP(angleDelta) {
+    try {
+      const engine = getRenderingEngine(RENDERING_ENGINE_ID)
+      const vp = engine?.getViewport(viewportId)
+      if (!vp) return
+      const cam = vp.getCamera()
+      if (!cam?.focalPoint) return
+      const fp = cam.focalPoint          // volume centre — stays fixed
+      const dist = Math.hypot(
+        cam.position[0] - fp[0],
+        cam.position[1] - fp[1],
+        cam.position[2] - fp[2],
+      ) || 800                           // fallback radius
+      angleRef.current = (angleRef.current + angleDelta + 360) % 360
+      const rad = (angleRef.current * Math.PI) / 180
+      // Orbit in the coronal plane: camera swings around the patient Z-axis.
+      // Position: rotate (initial front = -Y direction) around Z.
+      // Clinical MIP rotation: A→RAO→R→RPO→P→LPO→L→LAO→A
+      // In RAS coordinates: front = +Y (anterior), right = +X
+      const newPos = [
+        fp[0] + dist * Math.sin(rad),   // X: 0 at 0°, +dist at 90° (right lat)
+        fp[1] - dist * Math.cos(rad),   // Y: -dist at 0° (anterior view)
+        fp[2],                           // Z: unchanged
+      ]
+      vp.setCamera({
+        position:   newPos,
+        focalPoint: fp,
+        viewUp:     [0, 0, 1],           // always head-up
+      })
+      vp.render()
+    } catch(e) {}
+  }
+
+  function _stepSlice(delta) {
+    try {
+      const engine = getRenderingEngine(RENDERING_ENGINE_ID)
+      const vp = engine?.getViewport(viewportId)
+      if (!vp) return
+      // Both StackViewport and VolumeViewport in v2.1.16 expose scroll()
+      // which advances by N slices (positive = forward, negative = back).
+      if (typeof vp.scroll === 'function') {
+        vp.scroll(delta)
+      } else {
+        // Fallback: setImageIdIndex for stack viewports
+        const cur = vp.getCurrentImageIdIndex?.() ?? 0
+        const tot = vp.getImageIds?.()?.length ?? 1
+        vp.setImageIdIndex(Math.max(0, Math.min(tot - 1, cur + delta)))
+        vp.render()
+      }
+    } catch(e) {}
+  }
+
+  // ── rAF loop for MIP ─────────────────────────────────────────────────────
+  const fpsRef = useRef(fps)
+  useEffect(() => { fpsRef.current = fps }, [fps])
+
+  useEffect(() => {
+    if (!isMIP || !playing) return
+    let last = 0
+    playingRef.current = true
+
+    function loop(ts) {
+      if (!playingRef.current) return
+      // Throttle to chosen rpm converted to degrees-per-frame.
+      // fpsRef.current here is actually "rpm" for MIP but we use the same slider.
+      // At fps=6: 6 rev/min = 0.1 rev/s = 36 deg/s.
+      const interval = 1000 / Math.max(1, fpsRef.current) // ms between steps
+      if (ts - last >= interval) {
+        // degrees per step: one full revolution spread across 120 steps (smooth)
+        _stepMIP(3)   // 3 degrees per step ≈ 120 steps for full rotation
+        last = ts
+      }
+      rAFRef.current = requestAnimationFrame(loop)
+    }
+    rAFRef.current = requestAnimationFrame(loop)
+
+    return () => {
+      playingRef.current = false
+      if (rAFRef.current) { cancelAnimationFrame(rAFRef.current); rAFRef.current = null }
+    }
+  }, [playing, isMIP, viewportId])
+
+  // ── Interval loop for slice scroll ────────────────────────────────────────
+  useEffect(() => {
+    if (isMIP || !playing) return
+    playingRef.current = true
+    timerRef.current = setInterval(() => {
+      _stepSlice(1)
+    }, 1000 / Math.max(1, fps))
+
+    return () => {
+      playingRef.current = false
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null }
+    }
+  }, [playing, isMIP, viewportId, fps])
+
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      playingRef.current = false
+      if (rAFRef.current)   { cancelAnimationFrame(rAFRef.current);   rAFRef.current   = null }
+      if (timerRef.current) { clearInterval(timerRef.current);         timerRef.current = null }
+    }
+  }, [])
+
+  function stop() {
+    setPlaying(false)
+    playingRef.current = false
+    if (rAFRef.current)   { cancelAnimationFrame(rAFRef.current);   rAFRef.current   = null }
+    if (timerRef.current) { clearInterval(timerRef.current);         timerRef.current = null }
+  }
 
   return (
     <div style={{
       position: 'absolute', bottom: 0, left: 0, right: 0,
       height: 20,
-      background: 'rgba(0,0,0,.75)',
-      borderTop: '1px solid rgba(255,255,255,.1)',
+      background: isMIP ? 'rgba(220,220,220,.92)' : 'rgba(0,0,0,.75)',
+      borderTop: `1px solid ${isMIP ? 'rgba(0,0,0,.15)' : 'rgba(255,255,255,.1)'}`,
       display: 'flex', alignItems: 'center', gap: 4,
       padding: '0 6px', userSelect: 'none', zIndex: 55,
     }}>
       {/* Play/Pause */}
       <button
-        onMouseDown={e => { e.stopPropagation(); setPlaying(v => !v); }}
+        onMouseDown={e => { e.stopPropagation(); setPlaying(v => !v) }}
         style={{
-          background: 'none', border: 'none', color: '#ffffff',
+          background: 'none', border: 'none',
+          color: isMIP ? '#333333' : '#ffffff',
           fontSize: 11, cursor: 'pointer', padding: '0 2px', lineHeight: 1,
         }}
         title={playing ? 'Pause' : 'Play'}
@@ -1034,9 +1413,10 @@ function CineBar({ modality }) {
 
       {/* Stop */}
       <button
-        onMouseDown={e => { e.stopPropagation(); setPlaying(false); }}
+        onMouseDown={e => { e.stopPropagation(); stop() }}
         style={{
-          background: 'none', border: 'none', color: '#ffffff',
+          background: 'none', border: 'none',
+          color: isMIP ? '#333333' : '#ffffff',
           fontSize: 11, cursor: 'pointer', padding: '0 2px', lineHeight: 1,
         }}
         title="Stop"
@@ -1044,38 +1424,167 @@ function CineBar({ modality }) {
 
       {/* Step back */}
       <button
-        onMouseDown={e => e.stopPropagation()}
+        onMouseDown={e => {
+          e.stopPropagation()
+          if (isMIP) _stepMIP(-15)
+          else        _stepSlice(-1)
+        }}
         style={{
-          background: 'none', border: 'none', color: '#ffffff',
+          background: 'none', border: 'none',
+          color: isMIP ? '#333333' : '#ffffff',
           fontSize: 11, cursor: 'pointer', padding: '0 2px', lineHeight: 1,
         }}
-        title="Previous slice"
+        title={isMIP ? 'Rotate -15°' : 'Previous slice'}
       >⏮</button>
 
       {/* Step forward */}
       <button
-        onMouseDown={e => e.stopPropagation()}
+        onMouseDown={e => {
+          e.stopPropagation()
+          if (isMIP) _stepMIP(+15)
+          else        _stepSlice(+1)
+        }}
         style={{
-          background: 'none', border: 'none', color: '#ffffff',
+          background: 'none', border: 'none',
+          color: isMIP ? '#333333' : '#ffffff',
           fontSize: 11, cursor: 'pointer', padding: '0 2px', lineHeight: 1,
         }}
-        title="Next slice"
+        title={isMIP ? 'Rotate +15°' : 'Next slice'}
       >⏭</button>
 
-      {/* FPS */}
-      <span style={{ fontSize: 8, color: '#aaa', marginLeft: 4 }}>fps</span>
+      {/* FPS / RPM label */}
+      <span style={{ fontSize: 8, color: isMIP ? '#555' : '#aaa', marginLeft: 4 }}>
+        {isMIP ? 'rpm' : 'fps'}
+      </span>
       <input
         type="range" min={1} max={30} value={fps}
         onChange={e => setFps(+e.target.value)}
         onMouseDown={e => e.stopPropagation()}
-        style={{ width: 44, accentColor: '#00e5ff', height: 3 }}
+        style={{ width: 44, accentColor: isMIP ? '#336699' : '#00e5ff', height: 3 }}
       />
-      <span style={{ fontSize: 8, color: '#ffffff', minWidth: 14 }}>{fps}</span>
+      <span style={{ fontSize: 8, color: isMIP ? '#333' : '#ffffff', minWidth: 14 }}>{fps}</span>
 
       {/* Playing indicator */}
       {playing && (
-        <span style={{ fontSize: 8, color: '#00e5ff', marginLeft: 4 }}>● CINE</span>
+        <span style={{ fontSize: 8, color: isMIP ? '#336699' : '#00e5ff', marginLeft: 4 }}>
+          {isMIP ? '↻ ROT' : '● CINE'}
+        </span>
       )}
+    </div>
+  )
+}
+
+// ─── MIP Orientation Bar — 6 standard projection views ───────────────────────
+// Renders inside the MIP viewport only. One click instantly re-orients the
+// camera to the chosen standard view: A/P/R/L/H(ead)/F(oot).
+//
+// Camera strategy:
+//   1. Read current camera to get focal point (volume centre) + distance.
+//   2. Apply the new position + viewUp for the chosen direction.
+//   3. Call resetCamera() to refit parallelScale, then render().
+//
+// RAS convention (standard DICOM): X=Right, Y=Anterior, Z=Superior/Head.
+// So for an Anterior view we look from in front (-Y side, position Y < fp.Y).
+//
+// Note: resetCamera() after setCamera() is intentional — it refits the whole
+// volume to the viewport while using the orientation we just set. CS3D v2.1.16
+// resetCamera() respects the current camera viewUp and position direction.
+const MIP_VIEWS = [
+  { id: 'A', label: 'A',  title: 'Anterior',      pos: [0, -1, 0], up: [0, 0, 1] },
+  { id: 'P', label: 'P',  title: 'Posterior',     pos: [0, +1, 0], up: [0, 0, 1] },
+  { id: 'R', label: 'R',  title: 'Right Lateral', pos: [+1, 0, 0], up: [0, 0, 1] },
+  { id: 'L', label: 'L',  title: 'Left Lateral',  pos: [-1, 0, 0], up: [0, 0, 1] },
+  { id: 'H', label: 'H',  title: 'Head (Cranial)',pos: [0, 0, +1], up: [0, 1, 0] },
+  { id: 'F', label: 'F',  title: 'Foot (Caudal)', pos: [0, 0, -1], up: [0, 1, 0] },
+]
+
+function MIPOrientationBar({ viewportId }) {
+  const [activeView, setActiveView] = useState('A')
+
+  function _applyView(view) {
+    try {
+      const engine = getRenderingEngine(RENDERING_ENGINE_ID)
+      const vp = engine?.getViewport(viewportId)
+      if (!vp) return
+
+      const cam = vp.getCamera()
+      if (!cam?.focalPoint) return
+
+      const fp = cam.focalPoint
+      // Compute current orbit radius (distance from camera to focal point).
+      const dist = Math.hypot(
+        cam.position[0] - fp[0],
+        cam.position[1] - fp[1],
+        cam.position[2] - fp[2],
+      ) || 800
+
+      // Position the camera along the chosen direction, at the same distance.
+      const newPos = [
+        fp[0] + view.pos[0] * dist,
+        fp[1] + view.pos[1] * dist,
+        fp[2] + view.pos[2] * dist,
+      ]
+
+      // Set position + viewUp first so resetCamera() inherits the correct orientation.
+      vp.setCamera({
+        position:   newPos,
+        focalPoint: fp,
+        viewUp:     view.up,
+      })
+      // resetCamera() refits parallelScale to show the whole volume.
+      vp.resetCamera()
+      vp.render()
+      setActiveView(view.id)
+    } catch(e) {
+      console.warn('[MIPOrientationBar] applyView error:', e)
+    }
+  }
+
+  return (
+    <div style={{
+      position: 'absolute', top: 26, left: '50%',
+      transform: 'translateX(-50%)',
+      display: 'flex', gap: 3,
+      zIndex: 60, pointerEvents: 'auto',
+    }}>
+      {MIP_VIEWS.map(v => (
+        <button
+          key={v.id}
+          title={v.title}
+          onMouseDown={e => { e.stopPropagation(); _applyView(v) }}
+          style={{
+            width: 22, height: 18,
+            fontSize: 9, fontWeight: 'bold',
+            fontFamily: 'monospace',
+            cursor: 'pointer', lineHeight: 1,
+            border: `1px solid ${activeView === v.id ? '#336699' : '#999'}`,
+            borderRadius: 3,
+            background: activeView === v.id
+              ? '#336699'
+              : 'rgba(255,255,255,0.85)',
+            color: activeView === v.id ? '#ffffff' : '#333333',
+            padding: 0,
+            boxShadow: activeView === v.id
+              ? '0 1px 4px rgba(0,100,180,0.4)'
+              : '0 1px 2px rgba(0,0,0,0.15)',
+            transition: 'all 0.12s ease',
+          }}
+          onMouseEnter={e => {
+            if (activeView !== v.id) {
+              e.currentTarget.style.background = '#ddeeff'
+              e.currentTarget.style.borderColor = '#336699'
+            }
+          }}
+          onMouseLeave={e => {
+            if (activeView !== v.id) {
+              e.currentTarget.style.background = 'rgba(255,255,255,0.85)'
+              e.currentTarget.style.borderColor = '#999'
+            }
+          }}
+        >
+          {v.label}
+        </button>
+      ))}
     </div>
   )
 }

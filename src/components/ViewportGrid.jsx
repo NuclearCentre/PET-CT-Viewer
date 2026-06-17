@@ -55,6 +55,7 @@ export default function ViewportGrid({
   syncScroll = true,
   syncZoom   = false,
   syncPan    = false,
+  onMetaLoaded,   // Phase 5: callback(meta) fired once when patient/study info is ready
 }) {
   const [ctImageIds,  setCTImageIds]  = useState([]);
   const [petImageIds, setPETImageIds] = useState([]);
@@ -103,6 +104,36 @@ export default function ViewportGrid({
 
         console.log(`[ViewportGrid] CT: ${ctIds.length} images, PET: ${petIds.length} images`);
 
+        // ── Phase 5: fire complete patient/study/thumbnail meta once ─────────
+        // QIDO-RS carries patient/study tags on every series object.
+        // All data (instance UIDs for thumbnails) is available here after
+        // _buildImageIds, so we call onMetaLoaded exactly once with everything.
+        if (onMetaLoaded) {
+          try {
+            const s = ctSeries
+            const extractSOP = id => (id.match(/objectUID=([^&]+)/) || [])[1] || ''
+            onMetaLoaded({
+              name:        _parseName(s['00100010']?.Value?.[0]),
+              dob:         s['00100030']?.Value?.[0] || '',
+              sex:         s['00100040']?.Value?.[0] || '',
+              studyDate:   s['00080020']?.Value?.[0] || '',
+              studyDesc:   s['00081030']?.Value?.[0] || _desc(ctSeries) || '',
+              institution: s['00080080']?.Value?.[0]
+                        || petSeries['00080080']?.Value?.[0] || '',
+              ctCount:     ctIds.length,
+              petCount:    petIds.length,
+              ctSeriesUID: ctUID,
+              petSeriesUID: petUID,
+              studyUID,
+              // Middle slice is more representative than slice 0
+              ctThumbSOP:  extractSOP(ctIds[Math.floor(ctIds.length  / 2)]),
+              petThumbSOP: extractSOP(petIds[Math.floor(petIds.length / 2)]),
+            })
+          } catch(e) {
+            console.warn('[ViewportGrid] onMetaLoaded failed:', e)
+          }
+        }
+
         // Phase 3 — build (and start streaming) both volumes once, up front.
         if (RENDER_MODE === 'volume') {
           await ensureVolumes(ctIds, petIds);
@@ -120,10 +151,11 @@ export default function ViewportGrid({
     loadSeries();
   }, [studyUID]);
 
-  // ── Camera sync: match PET fusion viewports to CT viewport cameras ─────────
-  // CT and PET volumes may have different FOVs. After both are loaded and the
-  // viewports have rendered once, copy each CT viewport's camera to its
-  // corresponding PET fusion viewport so images appear the same size.
+  // ── Camera sync fallback: belt-and-suspenders for CT/PET size parity ────────
+  // ViewerBox.jsx does the primary sync via a one-shot IMAGE_RENDERED listener
+  // on each PET viewport (fires after the first render, after resetCamera settles).
+  // This fallback runs at 500ms — by then both CT and PET viewports have rendered
+  // at least once and their cameras are stable.
   useEffect(() => {
     if (!volumesReady) return;
     const pairs = [
@@ -131,26 +163,26 @@ export default function ViewportGrid({
       ['ct-coronal',  'pct-coronal'],
       ['ct-sagittal', 'pct-sagittal'],
     ];
-    // Wait two animation frames for viewports to complete their first render
-    let frame1 = requestAnimationFrame(() => {
-      let frame2 = requestAnimationFrame(() => {
-        try {
-          const engine = getRenderingEngine(RENDERING_ENGINE_ID);
-          if (!engine) return;
-          for (const [ctId, petId] of pairs) {
-            const ctVp  = engine.getViewport(ctId);
-            const petVp = engine.getViewport(petId);
-            if (!ctVp || !petVp) continue;
-            const cam = ctVp.getCamera();
-            if (cam) {
-              petVp.setCamera(cam);
-              petVp.render();
-            }
+    const timer = setTimeout(() => {
+      try {
+        const engine = getRenderingEngine(RENDERING_ENGINE_ID);
+        if (!engine) return;
+        for (const [ctId, petId] of pairs) {
+          const ctVp  = engine.getViewport(ctId);
+          const petVp = engine.getViewport(petId);
+          if (!ctVp || !petVp) continue;
+          const ctCam  = ctVp.getCamera();
+          if (!ctCam?.parallelScale) continue;
+          const petCam = petVp.getCamera();
+          // Only apply if parallelScale still differs (primary sync may have already fixed it)
+          if (Math.abs((petCam?.parallelScale || 0) - ctCam.parallelScale) > 0.01) {
+            petVp.setCamera({ ...petCam, parallelScale: ctCam.parallelScale });
+            petVp.render();
           }
-        } catch(e) {}
-      });
-    });
-    return () => { cancelAnimationFrame(frame1); };
+        }
+      } catch(e) {}
+    }, 500);
+    return () => clearTimeout(timer);
   }, [volumesReady]);
 
   // ── Layout helpers ────────────────────────────────────────────────────────
@@ -299,6 +331,19 @@ function _seriesUID(series) {
 }
 function _desc(series) {
   return series['0008103E']?.Value?.[0] || '';
+}
+// PatientName in QIDO-RS: { Alphabetic: "FAMILY^GIVEN" } or a plain string.
+// Convert to "GIVEN FAMILY" display form.
+function _parseName(nameObj) {
+  const raw = typeof nameObj === 'string' ? nameObj
+    : nameObj?.Alphabetic || nameObj?.value || String(nameObj || '')
+  if (!raw) return ''
+  if (raw.includes('^')) {
+    const parts = raw.split('^').map(p => p.trim()).filter(Boolean)
+    // [0]=family, [1]=given, [2]=middle — display as "Given Family"
+    return [...parts.slice(1), parts[0]].join(' ')
+  }
+  return raw
 }
 
 async function _buildImageIds(studyUID, seriesUID) {
