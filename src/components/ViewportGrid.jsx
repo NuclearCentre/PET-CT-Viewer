@@ -25,6 +25,7 @@ import { getRenderingEngine } from '@cornerstonejs/core';
 import ViewerBox from './ViewerBox.jsx';
 import { TOOL_GROUP_CT, TOOL_GROUP_PET, TOOL_GROUP_MPR, RENDERING_ENGINE_ID } from '../cornerstone-init.js';
 import { ensureVolumes, purgeVolumes } from '../utils/volumeManager.js';
+import { resetFusionTransform } from '../utils/fusionManager.js';
 
 // 'volume' → Phase 3 MPR/fusion/crosshairs · 'stack' → Phase 1/2 fallback
 const RENDER_MODE = 'volume';
@@ -56,6 +57,10 @@ export default function ViewportGrid({
   syncZoom   = false,
   syncPan    = false,
   onMetaLoaded,   // Phase 5: callback(meta) fired once when patient/study info is ready
+  // -- Phase 4 -- fusion controls
+  fusionMode   = 'auto',
+  fusionOffset = { tx:0, ty:0, tz:0, rx:0, ry:0, rz:0 },
+  fusionFixed  = false,
 }) {
   const [ctImageIds,  setCTImageIds]  = useState([]);
   const [petImageIds, setPETImageIds] = useState([]);
@@ -71,7 +76,7 @@ export default function ViewportGrid({
     setLoading(true);
     setError(null);
     setVolumesReady(false);
-    if (RENDER_MODE === 'volume') purgeVolumes();
+    if (RENDER_MODE === 'volume') { purgeVolumes(); resetFusionTransform(); }
 
     async function loadSeries() {
       try {
@@ -204,6 +209,9 @@ export default function ViewportGrid({
     petWLFusion: petWL,
   } : { renderMode: 'stack' };
 
+  // Fusion props added only to PET-CT viewports (modality === 'PET')
+  const fusionProps = (vp) => vp.modality === 'PET' ? { fusionMode, fusionOffset } : {};
+
   // ── Expanded (single viewport full-screen) ────────────────────────────────
   if (expandedId) {
     const all = [...CT_VIEWPORTS, ...PET_VIEWPORTS, MIP_VIEWPORT];
@@ -301,6 +309,7 @@ export default function ViewportGrid({
             syncScroll={syncScroll} syncZoom={syncZoom} syncPan={syncPan}
             onDoubleClick={() => onExpand(vp.id)}
             {...volProps(vp)}
+            {...fusionProps(vp)}
           />
         </div>
       ))}

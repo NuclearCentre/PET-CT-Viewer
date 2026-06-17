@@ -54,6 +54,7 @@ import {
   setPetOpacity,
   getOrientationMarkers,
 } from '../utils/volumeManager.js';
+import { applyFusionTransform, resetFusionTransform } from '../utils/fusionManager.js';
 
 const { ViewportType, Events, OrientationAxis } = CoreEnums;
 const { MouseBindings, KeyboardBindings } = ToolEnums;
@@ -131,6 +132,9 @@ export default function ViewerBox({
   volumesReady = false,          // gate: volumes built before we render
   ctWLFusion,                    // CT base W/L for fusion viewports
   petWLFusion,                   // PET overlay W/L for fusion viewports
+  // -- Phase 4 -- fusion mode controls
+  fusionMode = 'auto',           // 'auto' | 'manual'
+  fusionOffset = { tx:0,ty:0,tz:0,rx:0,ry:0,rz:0 },
 }) {
   const divRef      = useRef(null);
   const hasVP          = useRef(false);
@@ -350,6 +354,17 @@ export default function ViewerBox({
     setPetOpacity(viewportId, petOpacity);
   }, [petOpacity]);
 
+  // -- Phase 4: apply fusion transform when offset changes (PET viewports only) --
+  // fusionOffset changes come from FusionPanel sliders in App.jsx.
+  // fusionManager.applyFusionTransform sets the vtkActor user matrix on all 3
+  // PET-CT viewports simultaneously, so this effect fires on any PET viewport
+  // but the transform is applied to all three.
+  useEffect(() => {
+    if (!hasVP.current || !isVolume || modality !== 'PET') return
+    const { tx, ty, tz, rx, ry, rz } = fusionOffset
+    applyFusionTransform(tx, ty, tz, rx, ry, rz)
+  }, [fusionOffset, modality, isVolume])
+
   // ── Toolbar tool override ─────────────────────────────────────────────────
   useEffect(() => {
     if (!toolGroupId) return;
@@ -533,6 +548,8 @@ export default function ViewerBox({
             const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)
             if (!vp) return
             ann.invalidated = true
+            // Use CS3D's targeted annotation render API — guarantees renderAnnotation
+            // is called for every tool on this viewport, which re-runs cachedStats.
             try {
               triggerAnnotationRenderForViewportIds(triggerIds)
             } catch(e) {
@@ -601,21 +618,32 @@ export default function ViewerBox({
     return () => eventTarget.removeEventListener(VOLUME_LOADED, onVolumeLoaded)
   }, [viewportId])
 
-  // ── Textbox safe-zone clamping ────────────────────────────────────────────
-  // _clampAllTextboxes reads worldBoundingBox (set by CS3D during the preceding
-  // render) for every annotation owned by this viewport, computes how far the
-  // box is outside the safe zone, and shifts worldPosition by that amount.
-  // hasMoved=true makes CS3D use our corrected position on the next render.
+  // ---- Textbox safe-zone clamping ----------------------------------------
+  // Hard constraint: the textbox NEVER leaves the viewport safe zone, including
+  // after user drag. hasMoved=true makes CS3D use our corrected worldPosition
+  // instead of recalculating from annotation geometry on the next render.
   //
-  // Called from THREE places so the clamp fires reliably:
-  //   1. ANNOTATION_RENDERED — after every repaint (handles resize/scroll)
-  //   2. pointerup at t=0ms — immediately after user releases textbox drag
-  //   3. pointerup at t=150ms — belt-and-suspenders after CS3D settles
+  // Safe-zone margins:
+  //   PL=8   left
+  //   PR=30  right: 22px colormap strip + 8px margin
+  //   PT=22  top: ~20px label bar + 2px
+  //   PB=28  bottom: ~20px slice/info bar + 8px
   //
-  // Why pointerup is needed: ANNOTATION_RENDERED fires during the render cycle
-  // and worldBoundingBox may be from the PREVIOUS frame when it fires. After
-  // pointerup CS3D has committed the final dragged position to worldBoundingBox,
-  // so our clamp reads the true out-of-bounds position and corrects it.
+  // SHIFT MATH FIX (Session 6):
+  //   worldBoundingBox corners are projected to canvas min/max (left/right/top/bottom).
+  //   The correction is computed as the amount each edge overshoots its safe boundary,
+  //   then applied to pos (the worldPosition anchor). Both X and Y checks are
+  //   independent -- only the violated boundary contributes, never both at once,
+  //   so the box is pinned to exactly the safe boundary rather than
+  //   overshooting into the other edge when the box is large.
+  //
+  //   After correction we call triggerAnnotationRenderForViewportIds (not vp.render)
+  //   so CS3D re-runs renderAnnotation immediately, committing the corrected SVG
+  //   position in the same frame and preventing a stale-position flash.
+  //
+  // TIMING: three pointerup retries (t=0, 150, 300ms) cover the range from
+  //   "CS3D has committed worldPosition" to "CS3D has set worldBoundingBox from
+  //   the rendered position". The third retry catches slow GPU frames.
   const _clampAllTextboxes = useCallback(() => {
     try {
       const el = divRef.current
@@ -624,14 +652,7 @@ export default function ViewerBox({
       if (!vp) return
       const W = el.clientWidth
       const H = el.clientHeight
-      // Safe-zone margins (accounts for UI chrome overlaid on the CS3D canvas):
-      //   PL=8   left
-      //   PR=30  right: 22px colormap strip + 8px margin
-      //   PT=22  top: ~20px label bar + 2px
-      //   PB=28  bottom: ~20px slice/info bar + 8px
       const PL = 8, PR = 30, PT = 22, PB = 28
-      const safeW = W - PL - PR
-      const safeH = H - PT - PB
 
       const all = annotation.state.getAllAnnotations()
       let needsRender = false
@@ -646,16 +667,15 @@ export default function ViewerBox({
         const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
         const belongsHere = src === viewportId || (rowShared && inRow && inRow === myRow)
         if (!belongsHere) continue
-
         const tb = ann.data?.handles?.textBox
         if (!tb) continue
 
         const wb = tb.worldBoundingBox
         if (!wb?.topLeft || !wb?.topRight || !wb?.bottomLeft || !wb?.bottomRight) continue
         try {
-          // Project all 4 corners to canvas and take min/max.
-          // worldToCanvas can flip axes in MPR orientations so wb.topLeft does NOT
-          // reliably project to the canvas top-left corner. min/max is always correct.
+          // Project all 4 corners to canvas. worldToCanvas can flip axes in MPR
+          // orientations so wb.topLeft is NOT necessarily the canvas top-left.
+          // Using min/max is always orientation-correct.
           const cvCorners = [wb.topLeft, wb.topRight, wb.bottomLeft, wb.bottomRight]
             .map(w => vp.worldToCanvas(w))
           const xs     = cvCorners.map(c => c[0])
@@ -664,26 +684,33 @@ export default function ViewerBox({
           const top    = Math.min(...ys), bottom = Math.max(...ys)
           const boxW   = right - left
           const boxH   = bottom - top
-          const pos    = vp.worldToCanvas(tb.worldPosition)
 
-          // Shift = how much the box edge needs to move to reach the safe boundary.
-          // Applied to pos (worldPosition anchor) so the whole box moves by exactly that amount.
-          let sx = 0, sy = 0
-          if (boxW <= safeW) {
-            if (right  > W - PR) sx = (W - PR - boxW) - left
-            if (left   < PL)     sx = PL - left
-          } else {
-            sx = PL - left  // box wider than safe zone: pin to left edge
-          }
-          if (boxH <= safeH) {
-            if (bottom > H - PB) sy = (H - PB - boxH) - top
-            if (top    < PT)     sy = PT - top
-          } else {
-            sy = PT - top  // box taller than safe zone: pin to top edge
-          }
+          // Current canvas position of the worldPosition anchor
+          const pos = vp.worldToCanvas(tb.worldPosition)
 
-          if (sx !== 0 || sy !== 0) {
-            tb.worldPosition = vp.canvasToWorld([pos[0] + sx, pos[1] + sy])
+          // --- X axis clamp ---
+          // Compute desired canvas X so the box stays inside [PL, W-PR].
+          // We clamp the left edge and right edge independently, then resolve.
+          let targetX = pos[0]
+          const overRight = right - (W - PR)     // positive = box extends past right safe edge
+          const overLeft  = PL - left             // positive = box extends past left safe edge
+          if (overRight > 0) targetX = pos[0] - overRight
+          if (overLeft  > 0) targetX = pos[0] + overLeft
+          // If box is wider than safe zone, pin left edge to PL
+          if (boxW > (W - PL - PR)) targetX = pos[0] + (PL - left)
+
+          // --- Y axis clamp ---
+          let targetY = pos[1]
+          const overBottom = bottom - (H - PB)
+          const overTop    = PT - top
+          if (overBottom > 0) targetY = pos[1] - overBottom
+          if (overTop    > 0) targetY = pos[1] + overTop
+          if (boxH > (H - PT - PB)) targetY = pos[1] + (PT - top)
+
+          const dx = targetX - pos[0]
+          const dy = targetY - pos[1]
+          if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+            tb.worldPosition = vp.canvasToWorld([targetX, targetY])
             tb.hasMoved = true
             needsRender = true
           }
@@ -691,11 +718,10 @@ export default function ViewerBox({
       }
 
       if (needsRender) {
-        // CRITICAL: use triggerAnnotationRenderForViewportIds, NOT vp.render().
-        // vp.render() in CS3D v2.1.16 does NOT always re-run renderAnnotation,
-        // so the corrected worldPosition (set above) is never applied visually.
-        // triggerAnnotationRenderForViewportIds forces a full re-run of every
-        // tool's renderAnnotation on this viewport, which reads the new worldPosition.
+        // triggerAnnotationRenderForViewportIds re-runs renderAnnotation on every
+        // tool for this viewport -- guarantees the corrected position is painted
+        // in the same frame, preventing a stale-frame flash when the user drags
+        // the box to a boundary and releases.
         try {
           triggerAnnotationRenderForViewportIds([viewportId])
         } catch(e) {
@@ -809,13 +835,16 @@ export default function ViewerBox({
     eventTarget.addEventListener(MODIFIED, onAnnotationRendered)
 
     // pointerup backstop: fires after user releases a textbox drag.
-    // By t=0ms CS3D has committed the dragged worldPosition; by t=150ms
-    // it has definitely also set worldBoundingBox to the dragged position.
-    // Both calls together guarantee the clamp fires with current data.
+    // t=0:   CS3D has committed worldPosition to the dragged location.
+    // t=150: CS3D has set worldBoundingBox from the rendered position.
+    // t=300: belt-and-suspenders for slow GPU render frames.
+    // All three together guarantee the clamp always fires with current data
+    // and the box can never be left outside the safe zone after a drag.
     const el = divRef.current
     const onPointerUp = () => {
       setTimeout(_clampAllTextboxes, 0)
       setTimeout(_clampAllTextboxes, 150)
+      setTimeout(_clampAllTextboxes, 300)
     }
     if (el) el.addEventListener('pointerup', onPointerUp)
 
@@ -853,7 +882,7 @@ export default function ViewerBox({
           shouldShow = src === viewportId
         }
 
-        const currently = annotation.visibility.isAnnotationVisible(ann.annotationUID)
+        const currently  = annotation.visibility.isAnnotationVisible(ann.annotationUID)
         if (shouldShow !== currently) {
           annotation.visibility.setAnnotationVisibility(ann.annotationUID, shouldShow)
           changed = true
@@ -1003,11 +1032,12 @@ export default function ViewerBox({
       const all = annotation.state.getAllAnnotations()
       if (!all?.length) return
       const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
+      // Only remove annotations tagged to this viewport directly, or row-shared
+      // to this row. (Row-shared: single annotation object, removing it clears
+      // all pct- planes simultaneously.)
       all.forEach(ann => {
         const src = ann.metadata?.sourceViewportId
         const rowShared = ann.metadata?.rowShared && ann.metadata?.viewportRow === myRow
-        // Remove if tagged to this viewport directly, or row-shared to this row.
-        // (Row-shared: single annotation object, removing it clears all pct- planes.)
         if (!src || src === viewportId || rowShared) {
           annotation.state.removeAnnotation(ann.annotationUID)
         }
@@ -1070,6 +1100,14 @@ export default function ViewerBox({
           }}
         />
       </div>
+
+      {/* Fusion alignment overlay -- manual mode, PET-CT viewports only.
+          Dashed blue crosshair giving visual feedback that the PET layer is being
+          shifted/rotated. Centred in the viewport; translates proportionally to TX/TY
+          so the user can see the PET moving before the VTK actor re-renders. */}
+      {isVolume && modality === 'PET' && fusionMode === 'manual' && (
+        <FusionOverlay fusionOffset={fusionOffset} />
+      )}
 
       {/* Orientation markers (R/L/A/P/S/I) — volume MPR viewports only */}
       {isVolume && modality !== 'MIP' && <OrientationMarkers orientation={orientation} />}
@@ -1231,6 +1269,78 @@ function OrientationMarkers({ orientation }) {
       <div style={{ ...base, right: 26, top: '50%', transform: 'translateY(-50%)' }}>{m.right}</div>
     </>
   );
+}
+
+
+// --- FusionOverlay component --------------------------------------------------
+// Dashed blue crosshair overlay for manual PET-CT fusion mode.
+// Rendered as two absolutely-positioned divs on top of the CS3D canvas.
+// The crosshair origin shifts proportionally to TX/TY (1px per mm, capped at 40px)
+// so the user can see the PET layer moving even before the VTK actor re-renders.
+// RZ rotation is shown as a small arc indicator in the corner.
+function FusionOverlay({ fusionOffset }) {
+  const { tx, ty, rz } = fusionOffset
+  // Visual feedback scale: 1px per mm, capped so lines stay inside the viewport
+  const ox = Math.max(-40, Math.min(40, tx))
+  const oy = Math.max(-40, Math.min(40, ty))
+
+  const lineStyle = {
+    position: 'absolute',
+    background: 'rgba(100,200,255,0.75)',
+    pointerEvents: 'none',
+    zIndex: 55,
+  }
+
+  return (
+    <>
+      {/* Horizontal line */}
+      <div style={{
+        ...lineStyle,
+        left: 8, right: 22,
+        height: 1,
+        top: 'calc(50% + ' + Math.round(oy) + 'px)',
+        borderTop: '1px dashed rgba(100,200,255,0.9)',
+        background: 'transparent',
+      }} />
+      {/* Vertical line */}
+      <div style={{
+        ...lineStyle,
+        top: 0, bottom: 0,
+        width: 1,
+        left: 'calc(50% + ' + Math.round(ox) + 'px)',
+        borderLeft: '1px dashed rgba(100,200,255,0.9)',
+        background: 'transparent',
+      }} />
+      {/* Centre handle dot */}
+      <div style={{
+        ...lineStyle,
+        width: 8, height: 8,
+        borderRadius: '50%',
+        background: 'rgba(100,200,255,0.9)',
+        border: '1.5px solid #fff',
+        top: 'calc(50% + ' + Math.round(oy) + 'px - 4px)',
+        left: 'calc(50% + ' + Math.round(ox) + 'px - 4px)',
+      }} />
+      {/* Manual fusion label */}
+      <div style={{
+        position: 'absolute',
+        top: 22, left: '50%',
+        transform: 'translateX(-50%)',
+        fontSize: 9,
+        color: 'rgba(100,200,255,0.85)',
+        fontFamily: 'monospace',
+        pointerEvents: 'none',
+        zIndex: 56,
+        textShadow: '0 1px 3px rgba(0,0,0,0.9)',
+        whiteSpace: 'nowrap',
+      }}>
+        {rz !== 0
+          ? 'MANUAL FUSION  TX:' + (tx >= 0 ? '+' : '') + tx.toFixed(1) + '  TY:' + (ty >= 0 ? '+' : '') + ty.toFixed(1) + '  RZ:' + (rz >= 0 ? '+' : '') + rz.toFixed(1) + 'deg'
+          : 'MANUAL FUSION  TX:' + (tx >= 0 ? '+' : '') + tx.toFixed(1) + '  TY:' + (ty >= 0 ? '+' : '') + ty.toFixed(1)
+        }
+      </div>
+    </>
+  )
 }
 
 // ─── Apply viewport properties ────────────────────────────────────────────────
@@ -1490,8 +1600,8 @@ function CineBar({ viewportId, modality, isMIP }) {
 // volume to the viewport while using the orientation we just set. CS3D v2.1.16
 // resetCamera() respects the current camera viewUp and position direction.
 const MIP_VIEWS = [
-  { id: 'A', label: 'A',  title: 'Anterior',      pos: [0, -1, 0], up: [0, 0, 1] },
-  { id: 'P', label: 'P',  title: 'Posterior',     pos: [0, +1, 0], up: [0, 0, 1] },
+  { id: 'A', label: 'A',  title: 'Anterior',     pos: [0, -1, 0], up: [0, 0, 1] },
+  { id: 'P', label: 'P',  title: 'Posterior',    pos: [0, +1, 0], up: [0, 0, 1] },
   { id: 'R', label: 'R',  title: 'Right Lateral', pos: [+1, 0, 0], up: [0, 0, 1] },
   { id: 'L', label: 'L',  title: 'Left Lateral',  pos: [-1, 0, 0], up: [0, 0, 1] },
   { id: 'H', label: 'H',  title: 'Head (Cranial)',pos: [0, 0, +1], up: [0, 1, 0] },
