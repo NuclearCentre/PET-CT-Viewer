@@ -144,16 +144,10 @@ export async function initCornerstone() {
     console.log('[CS3D] tools registered');
 
     // -- Patch CircleROI hit-test + rim resize (verified against v2.1.16 src) ---
-    // Problem 1: isPointNearTool only hits within 3px of the outline ring, so
-    //   clicking inside the ROI pans the image instead of moving the ROI.
-    //   -> interior patch: any point inside the circle = hit = move.
-    // Problem 2: the resize handle (points[1]) is a single spot on the rim where
-    //   the user happened to finish drawing - practically impossible to find.
-    //   -> rim patch: hovering ANYWHERE on the rim activates the resize handle
-    //     (the dot becomes visible and dragging resizes the circle).
-    // Handle check runs BEFORE the tool-move check in CS3D, so: rim -> resize,
-    // interior -> move, outside -> pan. Exactly the standard viewer behaviour.
-    _patchCircleHandles(CircleROITool);
+    // Note: _patchCircleHandles was removed. The SVG overlay in ViewerBox.jsx
+    // draws 8 rim dots using canvas-space math (correct for all MPR orientations).
+    // The original 2-point getHandles (center + edge) is kept for hit detection
+    // since _patchCircleHandles world-space v2 vector is only correct for axial.
     _patchCircleInteriorHit(CircleROITool);
     _patchCircleInteriorHit(EllipticalROITool);
     _patchCircleRimResize(CircleROITool);
@@ -376,9 +370,25 @@ function _patchAnnotationDisplayFilter(AnyConcreteToolClass) {
       if (!planeFiltered?.length) return planeFiltered;
       const currentViewportId = getEnabledElement(element)?.viewportId;
       if (!currentViewportId) return planeFiltered;
+
+      // Determine which row this viewport belongs to ('pct' or 'ct' or null).
+      const currentRow = currentViewportId.startsWith('pct-') ? 'pct'
+                       : currentViewportId.startsWith('ct-')  ? 'ct'
+                       : null;
+
       return planeFiltered.filter(ann => {
         const src = ann.metadata?.sourceViewportId;
-        return !src || src === currentViewportId;
+        // No ownership tag → allow through (CS3D built-in annotations, crosshairs etc.)
+        if (!src) return true;
+        // Exact viewport match → always show
+        if (src === currentViewportId) return true;
+        // Row-shared annotation (e.g. PET-CT ROI drawn on any pct- plane):
+        // show on all viewports in the same row.
+        if (ann.metadata?.rowShared && ann.metadata?.viewportRow) {
+          return currentRow === ann.metadata.viewportRow;
+        }
+        // Different viewport, not row-shared → hide
+        return false;
       });
     };
 
@@ -390,56 +400,6 @@ function _patchAnnotationDisplayFilter(AnyConcreteToolClass) {
 }
 
 
-// P2: CircleROI 8 handle dots via prototype getHandles override.
-// CS3D v2 calls proto.getHandles() during render to determine which dots to draw.
-// We return center + 8 rim points. The original annotation.data.handles.points
-// stays [center, edge] so hit-test and link-line geometry are unaffected.
-function _patchCircleHandles(ToolClass) {
-  try {
-    const proto = ToolClass.prototype;
-    if (!proto || proto.__circleHandlesPatched) return;
-    const _orig = proto.getHandles;
-    proto.getHandles = function(annotation) {
-      const original = _orig ? _orig.call(this, annotation) : annotation && annotation.data && annotation.data.handles;
-      try {
-        const points = annotation && annotation.data && annotation.data.handles && annotation.data.handles.points;
-        if (!points || points.length < 2) return original;
-        const center = points[0];
-        const edge   = points[1];
-        const dx = edge[0] - center[0];
-        const dy = edge[1] - center[1];
-        const dz = (edge[2] || 0) - (center[2] || 0);
-        const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
-        if (len < 1e-6) return original;
-        const v1x = dx/len, v1y = dy/len, v1z = dz/len;
-        const v2x = -dy/len, v2y = dx/len, v2z = 0;
-        const angles = [0, 45, 90, 135, 180, 225, 270, 315];
-        const rimPoints = angles.map(function(deg) {
-          const rad = deg * Math.PI / 180;
-          const c = Math.cos(rad), s = Math.sin(rad);
-          return [
-            center[0] + len * (c * v1x + s * v2x),
-            center[1] + len * (c * v1y + s * v2y),
-            (center[2] || 0) + len * (c * v1z + s * v2z),
-          ];
-        });
-        return {
-          points: [center].concat(rimPoints),
-          activeHandleIndex: original ? original.activeHandleIndex : null,
-          textBox: original ? original.textBox : undefined,
-        };
-      } catch(e) {
-        return original;
-      }
-    };
-    proto.__circleHandlesPatched = true;
-    console.log('[CS3D] CircleROI 8-handle dots patch applied');
-  } catch(e) {
-    console.warn('[CS3D] _patchCircleHandles failed:', e && e.message);
-  }
-}
-
-// -- CircleROI / EllipticalROI interior hit patch ------------------------------
 // Makes the whole ROI interior draggable for MOVING (v2.1.16 only hits the
 // 3px-wide outline by default). Falls back to the original test on any error.
 function _patchCircleInteriorHit(ToolClass) {

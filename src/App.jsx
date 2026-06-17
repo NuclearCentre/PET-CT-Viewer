@@ -3,7 +3,9 @@
 // StrictMode MUST remain DISABLED in main.jsx
 
 import { useState, useCallback, useRef } from 'react'
+import { annotation as csAnnotation } from '@cornerstonejs/tools'
 import ViewportGrid from './components/ViewportGrid.jsx'
+import FusionPanel from './components/FusionPanel.jsx'
 import './App.css'
 
 const STUDY_UID  = '1.3.12.2.1107.5.1.4.60070.30000026012804495395400000013'
@@ -244,7 +246,7 @@ function PrintLayoutCard() {
 }
 
 // ─── Left Panel ───────────────────────────────────────────────────────────────
-function LeftPanel({ layout, onLayoutChange }) {
+function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFixed, onFusionModeChange, onFusionOffsetChange, onFixRequest, onFusionReset }) {
   return (
     <div style={{
       width: 180, minWidth: 180,
@@ -346,6 +348,37 @@ function LeftPanel({ layout, onLayoutChange }) {
           ><span style={{ fontSize: 18 }}>{icon}</span><span style={{ fontSize: 10 }}>{label}</span></div>
         ))}
       </Card>
+
+      {/* Fusion alignment */}
+      <div style={{
+        border: '1.5px solid #557755',
+        borderRadius: 5,
+        background: '#0d1a0d',
+        marginBottom: 8,
+        overflow: 'hidden',
+      }}>
+        <div style={{
+          padding: '6px 10px',
+          background: '#0a150a',
+          borderBottom: '1px solid #334433',
+          fontSize: 10, fontWeight: 'bold',
+          color: fusionMode === 'manual' ? '#ffee44' : '#88dd88',
+          textTransform: 'uppercase', letterSpacing: 1,
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        }}>
+          <span>PET Fusion</span>
+          {fusionFixed && <span style={{ fontSize: 8, color: '#ffcc44' }}>FIXED</span>}
+        </div>
+        <FusionPanel
+          fusionMode={fusionMode}
+          fusionOffset={fusionOffset}
+          fusionFixed={fusionFixed}
+          onModeChange={onFusionModeChange}
+          onOffsetChange={onFusionOffsetChange}
+          onFixRequest={onFixRequest}
+          onReset={onFusionReset}
+        />
+      </div>
 
       {/* Print Layout */}
       <PrintLayoutCard />
@@ -828,14 +861,31 @@ export default function App() {
   const [sync,            setSync]            = useState({ scroll: true, zoom: false, pan: false })
   const [expandedId,      setExpandedId]      = useState(null)
   const [rightCollapsed,  setRightCollapsed]  = useState(false)
+  // -- Phase 4 -- manual PET-CT fusion state
+  const [fusionMode,   setFusionMode]   = useState('auto')
+  const [fusionOffset, setFusionOffset] = useState({ tx:0, ty:0, tz:0, rx:0, ry:0, rz:0 })
+  const [fusionFixed,  setFusionFixed]  = useState(false)
+  const [showFixModal, setShowFixModal] = useState(false)
   const [showShortcuts,   setShowShortcuts]   = useState(false)
 
   const onSync   = useCallback((key, val) => setSync(p => ({ ...p, [key]: val })), [])
+  const onFusionReset = useCallback(() => {
+    setFusionOffset({ tx:0, ty:0, tz:0, rx:0, ry:0, rz:0 })
+    setFusionFixed(false)
+    setFusionMode('auto')
+  }, [])
+
+  const onConfirmFix = useCallback(() => {
+    setFusionFixed(true)
+    setShowFixModal(false)
+  }, [])
   const resetAll = useCallback(() => { setCTWL(DEF_CT_WL); setPETWL(DEF_PET_WL); setSUV(DEF_SUV) }, [])
   const clearROI = useCallback(() => {
     try {
-      const { annotation } = window.__cs3dTools__ || {}
-      annotation?.state?.removeAllAnnotations?.()
+      const all = csAnnotation.state.getAllAnnotations() || []
+      all.forEach(ann => {
+        try { csAnnotation.state.removeAnnotation(ann.annotationUID) } catch(e) {}
+      })
     } catch(e) {}
   }, [])
 
@@ -849,8 +899,67 @@ export default function App() {
       {/* Shortcuts modal */}
       {showShortcuts && <ShortcutsModal onClose={() => setShowShortcuts(false)} />}
 
+      {/* Fix fusion confirmation modal */}
+      {showFixModal && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 9000,
+          background: 'rgba(0,0,0,0.65)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <div style={{
+            background: '#1e1e1e', border: '0.5px solid #555', borderRadius: 10,
+            padding: '22px 24px', width: 340, boxShadow: '0 8px 40px rgba(0,0,0,0.9)',
+          }}>
+            <div style={{
+              width: 38, height: 38, borderRadius: '50%',
+              background: '#3a2a10', border: '1px solid #aa7a20',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 18, marginBottom: 14, color: '#ffcc66',
+            }}>&#9888;</div>
+            <div style={{ fontSize: 14, fontWeight: 500, color: '#eee', marginBottom: 8 }}>
+              Fix custom fusion position?
+            </div>
+            <div style={{ fontSize: 12, color: '#aaa', lineHeight: 1.7, marginBottom: 18 }}>
+              The PET volume has been shifted from its original acquisition alignment.
+              <br /><br />
+              <span style={{ color: '#ffcc66' }}>This new alignment will be applied</span> to
+              all 3 PET-CT planes and all ROIs for the duration of this study session.
+              <br /><br />
+              The original alignment is automatically restored when the study is closed.
+            </div>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setShowFixModal(false)}
+                style={{
+                  padding: '7px 16px', background: 'transparent',
+                  border: '0.5px solid #555', borderRadius: 5,
+                  color: '#aaa', fontSize: 12, cursor: 'pointer',
+                }}
+              >Cancel</button>
+              <button
+                onClick={onConfirmFix}
+                style={{
+                  padding: '7px 16px', background: '#3a2a10',
+                  border: '1px solid #aa7a20', borderRadius: 5,
+                  color: '#ffcc66', fontSize: 12, cursor: 'pointer', fontWeight: 500,
+                }}
+              >&#128274; Fix alignment</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Left panel — full height from top */}
-      <LeftPanel layout={layout} onLayoutChange={setLayout} />
+      <LeftPanel
+        layout={layout} onLayoutChange={setLayout}
+        fusionMode={fusionMode}
+        fusionOffset={fusionOffset}
+        fusionFixed={fusionFixed}
+        onFusionModeChange={setFusionMode}
+        onFusionOffsetChange={setFusionOffset}
+        onFixRequest={() => setShowFixModal(true)}
+        onFusionReset={onFusionReset}
+      />
 
       {/* Centre + right — column */}
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -886,6 +995,9 @@ export default function App() {
                 syncScroll={sync.scroll}
                 syncZoom={sync.zoom}
                 syncPan={sync.pan}
+                fusionMode={fusionMode}
+                fusionOffset={fusionOffset}
+                fusionFixed={fusionFixed}
               />
             </div>
             <StatusBar ctWL={ctWL} petWL={petWL} suv={suv} sync={sync} activeTool={activeTool} />
