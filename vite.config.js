@@ -22,5 +22,13 @@ export default defineConfig({
   },
   worker: {
     format: 'es',
+    rolldownOptions: {
+      external: ['@icr/polyseg-wasm'],
+    },
+  },
+  build: {
+    rolldownOptions: {
+      external: ['@icr/polyseg-wasm'],
+    },
   },
 })

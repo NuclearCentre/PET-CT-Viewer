@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NonInteractive -Command \"cd 'D:\\PET-CT Viewer\\petct-viewer'; $status = git status --porcelain; if ($status) { $msg = 'Auto-save: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm'); git add .; git commit -m $msg; git push origin main } else { Write-Output 'Nothing to commit' }\""
+          }
+        ]
+      }
+    ]
+  }
+}

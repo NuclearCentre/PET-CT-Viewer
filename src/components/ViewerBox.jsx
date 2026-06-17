@@ -26,6 +26,7 @@ import {
   getRenderingEngine,
   Enums as CoreEnums,
   eventTarget,
+  getEnabledElementByViewportId,
 } from '@cornerstonejs/core';
 import {
   ToolGroupManager,
@@ -34,8 +35,18 @@ import {
   ZoomTool,
   WindowLevelTool,
   annotation,
-  triggerAnnotationRenderForViewportIds,
 } from '@cornerstonejs/tools';
+
+function triggerAnnotationRenderForViewportIds(viewportIds) {
+  if (!viewportIds || !viewportIds.length) return;
+  viewportIds.forEach((vid) => {
+    const ee = getEnabledElementByViewportId(vid);
+    if (ee && ee.viewport) {
+      annotation.state.getAnnotationManager();
+      ee.viewport.render();
+    }
+  });
+}
 import {
   RENDERING_ENGINE_ID,
   SYNC_SCROLL_ID, SYNC_ZOOM_ID, SYNC_PAN_ID, SYNC_VIEWPORT_IDS,
