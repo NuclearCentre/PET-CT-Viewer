@@ -152,21 +152,31 @@ const voiFromWL = (wl) => ({
   upper: wl.wc + wl.ww / 2,
 });
 
-// PET opacity ramp: background transparent, uptake visible at blend level.
-// Array format confirmed from setOpacity source: [{ value, opacity }, ...]
+// PET opacity: power curve approximation matching clinical adaptive blend.
+//
+// From WebGL clinical renderer reference (adaptive blend mode):
+//   adaptiveAlpha = pow(petNorm, power) * globalAlpha
+//   finalColor = mix(ct, pet, adaptiveAlpha)
+//
+// power=1.5 gives: background near-zero, moderate uptake ~25%, hot spots ~70%.
+// This is approximated as 10 piecewise-linear VTK control points.
+// globalOpacity (blend slider 0-1) scales the entire curve.
+//
+// petWL defines the scalar display window. Values outside [lower, upper]
+// are clamped by VTK — values above upper get max opacity = blend.
 function _petOpacityArray(petWL, globalOpacity) {
-  const blend = Math.max(0, Math.min(1, typeof globalOpacity === 'number' ? globalOpacity : 0.6));
+  const blend = Math.max(0, Math.min(1, typeof globalOpacity === 'number' ? globalOpacity : 0.7));
   const lower = petWL.wc - petWL.ww / 2;
   const upper = petWL.wc + petWL.ww / 2;
   const range = upper - lower;
-  if (range <= 0) return [{ value: 0, opacity: 0 }, { value: 10000, opacity: blend }];
-  return [
-    { value: lower,                opacity: 0           },
-    { value: lower + range * 0.05, opacity: 0           },
-    { value: lower + range * 0.20, opacity: blend * 0.3 },
-    { value: lower + range * 0.50, opacity: blend * 0.7 },
-    { value: upper,                opacity: blend        },
-  ];
+  if (range <= 0) return [{ value: 0, opacity: 0 }, { value: 7000, opacity: blend }];
+
+  // pow(norm, 1.5) * blend — 10 control points for smooth approximation
+  const pts = [0, 0.02, 0.05, 0.10, 0.20, 0.35, 0.50, 0.65, 0.80, 1.0];
+  return pts.map(n => ({
+    value:   lower + n * range,
+    opacity: Math.pow(n, 1.5) * blend,
+  }));
 }
 
 // ─── CT-only MPR viewport ──────────────────────────────────────────────────────
@@ -188,8 +198,11 @@ export async function applyFusionVolumes(vp, { ctWL, petWL, petColormapName, pet
   // CT: colormap + VOI. Then opacity 0.99 to force VTK alpha-compositing mode.
   // Without this, CT renders fully opaque and PET is completely invisible.
   vp.setProperties({ voiRange: voiFromWL(ctWL), colormap: { name: 'petct_gray' } }, CT_VOLUME_ID);
-  vp.setProperties({ colormap: { opacity: 0.99 } }, CT_VOLUME_ID);
-  console.log('[volumeManager] CT: colormap + opacity 0.99 applied');
+  // CT opacity 0.85: anatomy remains crisp and legible.
+  // Any value < 1.0 enables VTK alpha-compositing so PET composites through.
+  // Clinical reference: CT contributes ~45% weight at max PET uptake (alpha=0.55).
+  vp.setProperties({ colormap: { opacity: 0.85 } }, CT_VOLUME_ID);
+  console.log('[volumeManager] CT: colormap + opacity 0.85 applied');
 
   // PET: colormap + VOI + transparency ramp.
   vp.setProperties({ voiRange: voiFromWL(petWL), colormap: { name: petColormapName } }, PET_VOLUME_ID);

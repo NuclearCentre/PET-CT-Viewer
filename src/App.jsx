@@ -6,6 +6,7 @@ import { useState, useCallback, useRef } from 'react'
 import { annotation as csAnnotation } from '@cornerstonejs/tools'
 import ViewportGrid from './components/ViewportGrid.jsx'
 import FusionPanel from './components/FusionPanel.jsx'
+import SeriesPanel from './components/SeriesPanel.jsx'
 import './App.css'
 
 const STUDY_UID  = '1.3.12.2.1107.5.1.4.60070.30000026012804495395400000013'
@@ -247,6 +248,8 @@ function PrintLayoutCard() {
 
 // ─── Left Panel ───────────────────────────────────────────────────────────────
 function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFixed, onFusionModeChange, onFusionOffsetChange, onFixRequest, onFusionReset }) {
+  const [seriesPanelOpen, setSeriesPanelOpen] = useState(true)
+
   return (
     <div style={{
       width: 180, minWidth: 180,
@@ -274,13 +277,40 @@ function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFix
         </div>
       </div>
 
-      {/* Current Study */}
-      <Card title="Current Study" color="#6699cc">
-        <div style={{ fontSize: 9, color: '#2255aa', fontWeight: 'bold', marginBottom: 3 }}>ALKA JAGTAP</div>
-        <div style={{ fontSize: 8, color: '#444', marginBottom: 2 }}>PET-CT Whole Body</div>
-        <div style={{ fontSize: 8, color: '#666', marginBottom: 2 }}>28 Jan 2026</div>
-        <div style={{ fontSize: 8, color: '#666' }}>165 CT · 33 PT images</div>
-      </Card>
+      {/* Current Study — patient header */}
+      <div style={cardStyle('#6699cc')}>
+        <div
+          style={cardHeaderStyle('#6699cc')}
+          onClick={() => setSeriesPanelOpen(v => !v)}
+        >
+          <span>Current Study</span>
+          <span style={{ fontSize: 9, color: '#aaa' }}>{seriesPanelOpen ? '▲' : '▼'}</span>
+        </div>
+        <div style={{ ...cardBodyStyle(), padding: '6px 8px' }}>
+          {/* Static patient header — will be replaced by real onMetaLoaded data in Phase 5 */}
+          <div style={{ fontSize: 9, color: '#2255aa', fontWeight: 'bold', marginBottom: 2 }}>ALKA JAGTAP</div>
+          <div style={{ fontSize: 8, color: '#444', marginBottom: 1 }}>PET-CT Whole Body</div>
+          <div style={{ fontSize: 8, color: '#666', marginBottom: 1 }}>28 Jan 2026 · F · 52y</div>
+          <div style={{ fontSize: 8, color: '#888', marginBottom: 4 }}>Tata Memorial Hospital</div>
+
+          {/* Drag hint */}
+          {seriesPanelOpen && (
+            <div style={{
+              fontSize: 7, color: '#6699cc', padding: '3px 5px',
+              background: '#eef3ff', border: '1px dashed #aabbd8',
+              borderRadius: 3, marginBottom: 6, lineHeight: 1.5,
+            }}>
+              ⇢ Drag <b>CT</b> → CT·Axial<br/>
+              ⇢ Drag <b>PET</b> → PET·Axial
+            </div>
+          )}
+
+          {/* Series list */}
+          {seriesPanelOpen && (
+            <SeriesPanel studyUID={STUDY_UID} />
+          )}
+        </div>
+      </div>
 
       {/* Worklist */}
       <Card title="Worklist" color="#7799bb" defaultOpen={true}>

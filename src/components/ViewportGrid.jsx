@@ -20,7 +20,7 @@
  *   SUV threshold   → all 3 PET-CT viewports
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { getRenderingEngine } from '@cornerstonejs/core';
 import ViewerBox from './ViewerBox.jsx';
 import { TOOL_GROUP_CT, TOOL_GROUP_PET, TOOL_GROUP_MPR, RENDERING_ENGINE_ID } from '../cornerstone-init.js';
@@ -69,6 +69,90 @@ export default function ViewportGrid({
   const [error,   setError]           = useState(null);
   const [seriesInfo, setSeriesInfo]   = useState({ ct: null, pet: null });
   const [volumesReady, setVolumesReady] = useState(false);
+
+  // ── Drop-series state ─────────────────────────────────────────────────────
+  // Tracks which viewport is being hovered during a drag, and whether a
+  // series-swap is in progress (shows a loading spinner overlay on that box).
+  const [dropOverId,   setDropOverId]   = useState(null);   // viewport id being hovered
+  const [dropLoadId,   setDropLoadId]   = useState(null);   // viewport id currently loading a dropped series
+  const dropBuildRef = useRef(false);                        // prevents concurrent volume rebuilds
+
+  /**
+   * Called when a SeriesPanel card is dropped on a viewport wrapper.
+   * Rules:
+   *   CT series dropped on ct-axial   → rebuild CT imageIds + volumes
+   *   PT series dropped on pct-axial  → rebuild PET imageIds + volumes
+   *   Coronal / Sagittal wrappers reject drops (they are MPR-reconstructed)
+   */
+  const handleSeriesDrop = useCallback(async (e, viewportId) => {
+    e.preventDefault();
+    setDropOverId(null);
+
+    const raw = e.dataTransfer.getData('application/petct-series');
+    if (!raw) return;
+
+    let payload;
+    try { payload = JSON.parse(raw); } catch { return; }
+
+    const { seriesUID, modality } = payload;
+    if (!seriesUID) return;
+
+    // Only axial viewports accept drops
+    const acceptsCT  = viewportId === 'ct-axial'  && modality === 'CT';
+    const acceptsPET = viewportId === 'pct-axial' && (modality === 'PT' || modality === 'PET');
+    if (!acceptsCT && !acceptsPET) return;
+
+    if (dropBuildRef.current) return;  // already rebuilding
+    dropBuildRef.current = true;
+    setDropLoadId(viewportId);
+
+    try {
+      const newIds = await _buildImageIds(studyUID, seriesUID);
+
+      if (RENDER_MODE === 'volume') {
+        purgeVolumes();
+        resetFusionTransform();
+        setVolumesReady(false);
+      }
+
+      if (acceptsCT) {
+        setCTImageIds(newIds);
+        if (RENDER_MODE === 'volume') {
+          await ensureVolumes(newIds, petImageIds.length > 0 ? petImageIds : newIds);
+        }
+      } else {
+        setPETImageIds(newIds);
+        setMIPImageIds(newIds);
+        if (RENDER_MODE === 'volume') {
+          await ensureVolumes(ctImageIds.length > 0 ? ctImageIds : newIds, newIds);
+        }
+      }
+
+      if (RENDER_MODE === 'volume') setVolumesReady(true);
+    } catch(err) {
+      console.error('[ViewportGrid] drop-series error:', err);
+    } finally {
+      dropBuildRef.current = false;
+      setDropLoadId(null);
+    }
+  }, [studyUID, ctImageIds, petImageIds]);
+
+  const handleDragOver = useCallback((e, viewportId) => {
+    const raw = e.dataTransfer.types?.includes('application/petct-series');
+    if (!raw) return;
+    // Only allow drops on axial viewports
+    if (viewportId !== 'ct-axial' && viewportId !== 'pct-axial') return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    setDropOverId(viewportId);
+  }, []);
+
+  const handleDragLeave = useCallback((e) => {
+    // Only clear if leaving the wrapper itself (not a child)
+    if (!e.currentTarget.contains(e.relatedTarget)) {
+      setDropOverId(null);
+    }
+  }, []);
 
   // ── Fetch series from Orthanc ─────────────────────────────────────────────
   useEffect(() => {
@@ -193,14 +277,16 @@ export default function ViewportGrid({
           }
         }
 
-        // MIP zoom: match ct-coronal anatomical magnification
+        // MIP zoom: the MIP box spans 2 rows but resetCamera() fits to 1-row height.
+        // Target = ct-coronal parallelScale * 2 so the body fills the full 2-row box
+        // at the same pixel-per-mm density as the coronal viewports.
         const ctCorVp = engine.getViewport('ct-coronal');
         const mipVp   = engine.getViewport('mip');
         if (ctCorVp && mipVp) {
           const ctCorCam = ctCorVp.getCamera();
           const mipCam   = mipVp.getCamera();
           if (ctCorCam?.parallelScale && mipCam) {
-            const targetScale = ctCorCam.parallelScale;
+            const targetScale = ctCorCam.parallelScale * 2;
             if (Math.abs((mipCam.parallelScale || 0) - targetScale) > 0.01) {
               mipVp.setCamera({ ...mipCam, parallelScale: targetScale });
               mipVp.render();
@@ -273,24 +359,43 @@ export default function ViewportGrid({
       gap: 3, padding: 3,
     }}>
       {/* Row 1 — CT viewports (CT volume MPR) */}
-      {CT_VIEWPORTS.map(vp => (
-        <div key={vp.id} style={{ position: 'relative', minWidth: 0, minHeight: 0 }}>
-          <ViewerBox
-            viewportId={vp.id}
-            label={vp.label}
-            modality={vp.modality}
-            accentColor={vp.accentColor}
-            imageIds={ctReady ? ctImageIds : []}
-            toolGroupId={isVolume ? TOOL_GROUP_MPR : TOOL_GROUP_CT}
-            wl={ctWL}
-            onWL={onCTWL}
-            activeToolOverride={activeToolCT}
-            syncScroll={syncScroll} syncZoom={syncZoom} syncPan={syncPan}
-            onDoubleClick={() => onExpand(vp.id)}
-            {...volProps(vp)}
-          />
-        </div>
-      ))}
+      {CT_VIEWPORTS.map(vp => {
+        const isAxial   = vp.id === 'ct-axial';
+        const isDragOver = dropOverId === vp.id;
+        const isLoading  = dropLoadId === vp.id;
+        return (
+          <div
+            key={vp.id}
+            style={{ position: 'relative', minWidth: 0, minHeight: 0 }}
+            onDragOver={isAxial ? (e) => handleDragOver(e, vp.id) : undefined}
+            onDragLeave={isAxial ? handleDragLeave : undefined}
+            onDrop={isAxial ? (e) => handleSeriesDrop(e, vp.id) : undefined}
+          >
+            <ViewerBox
+              viewportId={vp.id}
+              label={vp.label}
+              modality={vp.modality}
+              accentColor={vp.accentColor}
+              imageIds={ctReady ? ctImageIds : []}
+              toolGroupId={isVolume ? TOOL_GROUP_MPR : TOOL_GROUP_CT}
+              wl={ctWL}
+              onWL={onCTWL}
+              activeToolOverride={activeToolCT}
+              syncScroll={syncScroll} syncZoom={syncZoom} syncPan={syncPan}
+              onDoubleClick={() => onExpand(vp.id)}
+              {...volProps(vp)}
+            />
+            {/* Drop overlay — shows on drag-over (axial only) */}
+            {isAxial && (isDragOver || isLoading) && (
+              <DropOverlay loading={isLoading} color="#88c4ff" label="CT Series" />
+            )}
+            {/* Reconstructed badge on coronal/sagittal */}
+            {!isAxial && (
+              <ReconstructedBadge color="#88c4ff" />
+            )}
+          </div>
+        );
+      })}
 
       {/* MIP — spans 2 rows, col 4 (PET MIP, never crosshair-linked) */}
       <div style={{
@@ -312,30 +417,99 @@ export default function ViewportGrid({
       </div>
 
       {/* Row 2 — PET-CT viewports (CT+PET fusion) */}
-      {PET_VIEWPORTS.map(vp => (
-        <div key={vp.id} style={{ position: 'relative', minWidth: 0, minHeight: 0 }}>
-          <ViewerBox
-            viewportId={vp.id}
-            label={vp.label}
-            modality={vp.modality}
-            accentColor={vp.accentColor}
-            imageIds={petReady ? petImageIds : []}
-            toolGroupId={isVolume ? TOOL_GROUP_MPR : TOOL_GROUP_PET}
-            wl={petWL}
-            onWL={onPETWL}
-            suvMin={suvThreshold?.min}
-            suvMax={suvThreshold?.max}
-            onSUV={onSUV}
-            petOpacity={petOpacity}
-            onOpacity={onOpacity}
-            activeToolOverride={activeToolPET}
-            syncScroll={syncScroll} syncZoom={syncZoom} syncPan={syncPan}
-            onDoubleClick={() => onExpand(vp.id)}
-            {...volProps(vp)}
-            {...fusionProps(vp)}
-          />
-        </div>
-      ))}
+      {PET_VIEWPORTS.map(vp => {
+        const isAxial    = vp.id === 'pct-axial';
+        const isDragOver = dropOverId === vp.id;
+        const isLoading  = dropLoadId === vp.id;
+        return (
+          <div
+            key={vp.id}
+            style={{ position: 'relative', minWidth: 0, minHeight: 0 }}
+            onDragOver={isAxial ? (e) => handleDragOver(e, vp.id) : undefined}
+            onDragLeave={isAxial ? handleDragLeave : undefined}
+            onDrop={isAxial ? (e) => handleSeriesDrop(e, vp.id) : undefined}
+          >
+            <ViewerBox
+              viewportId={vp.id}
+              label={vp.label}
+              modality={vp.modality}
+              accentColor={vp.accentColor}
+              imageIds={petReady ? petImageIds : []}
+              toolGroupId={isVolume ? TOOL_GROUP_MPR : TOOL_GROUP_PET}
+              wl={petWL}
+              onWL={onPETWL}
+              suvMin={suvThreshold?.min}
+              suvMax={suvThreshold?.max}
+              onSUV={onSUV}
+              petOpacity={petOpacity}
+              onOpacity={onOpacity}
+              activeToolOverride={activeToolPET}
+              syncScroll={syncScroll} syncZoom={syncZoom} syncPan={syncPan}
+              onDoubleClick={() => onExpand(vp.id)}
+              {...volProps(vp)}
+              {...fusionProps(vp)}
+            />
+            {/* Drop overlay — shows on drag-over (axial only) */}
+            {isAxial && (isDragOver || isLoading) && (
+              <DropOverlay loading={isLoading} color="#88dd88" label="PET Series" />
+            )}
+            {/* Reconstructed badge on coronal/sagittal */}
+            {!isAxial && (
+              <ReconstructedBadge color="#88dd88" />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Drop overlay — shown over axial viewport during drag-over or loading ──────
+function DropOverlay({ loading, color, label }) {
+  return (
+    <div style={{
+      position: 'absolute', inset: 0, zIndex: 50,
+      background: loading ? 'rgba(0,0,0,0.6)' : `${color}22`,
+      border: `2px dashed ${color}`,
+      borderRadius: 3,
+      display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center',
+      gap: 6, pointerEvents: 'none',
+    }}>
+      {loading ? (
+        <>
+          <span style={{
+            fontSize: 18, color, display: 'inline-block',
+            animation: 'spin 1s linear infinite',
+          }}>⟳</span>
+          <span style={{ fontSize: 9, color, textShadow: '0 1px 3px rgba(0,0,0,.9)' }}>
+            Loading {label}…
+          </span>
+        </>
+      ) : (
+        <>
+          <span style={{ fontSize: 20, color }}>⇩</span>
+          <span style={{ fontSize: 9, color, textShadow: '0 1px 3px rgba(0,0,0,.9)', fontWeight: 'bold' }}>
+            Drop {label} here
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Reconstructed badge — shown on coronal/sagittal viewports ─────────────────
+function ReconstructedBadge({ color }) {
+  return (
+    <div style={{
+      position: 'absolute', top: 4, left: 4, zIndex: 30,
+      background: 'rgba(0,0,0,0.55)',
+      border: `1px solid ${color}55`,
+      borderRadius: 2, padding: '1px 4px',
+      fontSize: 7, color: `${color}bb`,
+      letterSpacing: 0.5, pointerEvents: 'none',
+    }}>
+      MPR RECON
     </div>
   );
 }

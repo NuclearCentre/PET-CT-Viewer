@@ -265,22 +265,8 @@ export default function ViewerBox({
         } else { // MIP
           await applyMIPVolume(vp, { petWL: wl, colormapName: `petct_${paletteId}`, orientation });
 
-          // ── MIP zoom parity ───────────────────────────────────────────────
-          // After resetCamera() the MIP shows the patient at the same zoom as
-          // a 1-row coronal, but the MIP box is 2 rows tall — so the patient
-          // only fills the top half with black below. Fix: double parallelScale
-          // so the patient fills the full 2-row height at the same pixel-per-mm
-          // density as the coronal viewports.
-          // Done on first IMAGE_RENDERED (after resetCamera has settled).
-          el.addEventListener(Events.IMAGE_RENDERED, function syncMIPZoomOnce() {
-            el.removeEventListener(Events.IMAGE_RENDERED, syncMIPZoomOnce)
-            try {
-              const cam = vp.getCamera()
-              if (!cam?.parallelScale) return
-              vp.setCamera({ ...cam, parallelScale: cam.parallelScale * 2 })
-              vp.render()
-            } catch(e) {}
-          })
+          // MIP zoom is handled by ViewportGrid's 500ms timer after all
+          // viewports are stable. No zoom adjustment here to avoid conflicts.
         }
         if (cancelled) return;
         hasVP.current = true;
