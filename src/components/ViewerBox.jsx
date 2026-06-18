@@ -51,6 +51,7 @@ import {
   applyFusionVolumes,
   applyMIPVolume,
   setFusionPetProperties,
+  setFusionCtVOI,
   setPetOpacity,
   getOrientationMarkers,
 } from '../utils/volumeManager.js';
@@ -383,8 +384,9 @@ export default function ViewerBox({
           try { vp.setProperties({ voiRange: _voi(wl), colormap: { name: cmap } }); }
           catch(e) { vp.setProperties({ voiRange: _voi(wl) }); }
         } else if (modality === 'PET') {
-          // CT base keeps its own W/L; PET overlay gets the green W/L + colormap.
-          try { vp.setProperties({ voiRange: _voi(ctWLFusion || { wc:40, ww:400 }) }, CT_VOLUME_ID); } catch(e) {}
+          // CT: VOI only. Colormap and 0.99 opacity were set at init and stay stable.
+          setFusionCtVOI(vp, ctWLFusion || { wc: 40, ww: 400 });
+          // PET: VOI + colormap + opacity ramp.
           setFusionPetProperties(vp, { petWL: petWLFusion || wl, petColormapName: cmap, petOpacity });
         } else { // MIP
           try { vp.setProperties({ voiRange: _voi(wl), colormap: { name: cmap } }); }
