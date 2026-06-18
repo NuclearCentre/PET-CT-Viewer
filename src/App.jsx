@@ -4,7 +4,7 @@
 
 import { useState, useCallback, useRef } from 'react'
 import { annotation as csAnnotation } from '@cornerstonejs/tools'
-import ViewportGrid from './components/ViewportGrid.jsx'
+import ViewportGrid, { LAYOUT_DEFS } from './components/ViewportGrid.jsx'
 import FusionPanel from './components/FusionPanel.jsx'
 import SeriesPanel from './components/SeriesPanel.jsx'
 import './App.css'
@@ -246,206 +246,464 @@ function PrintLayoutCard() {
   )
 }
 
-// ─── Left Panel ───────────────────────────────────────────────────────────────
+// ─── Left Panel — telephone-index tab design ──────────────────────────────────
+// Each section has a coloured vertical label strip between the left edge and
+// the card content, exactly like the lettered tabs in a telephone index diary.
 function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFixed, onFusionModeChange, onFusionOffsetChange, onFixRequest, onFusionReset }) {
-  const [seriesPanelOpen, setSeriesPanelOpen] = useState(true)
+  const [selectedCard, setSelectedCard] = useState('Current Study')
+  const [avatarColor,  setAvatarColor]  = useState('#185fa5')
+
+  // Swatch palette — 6 options covering warm, cool, and neutral tones
+  const AVATAR_SWATCHES = [
+    { color: '#185fa5', label: 'Blue'   },
+    { color: '#0f6e56', label: 'Teal'   },
+    { color: '#534ab7', label: 'Purple' },
+    { color: '#993c1d', label: 'Coral'  },
+    { color: '#3b6d11', label: 'Green'  },
+    { color: '#885533', label: 'Brown'  },
+  ]
+
+  // Derive a lighter tint for the zone background from the selected colour
+  const zoneBg = avatarColor + '18'   // 10% alpha overlay
 
   return (
     <div style={{
-      width: 180, minWidth: 180,
+      width: 192, minWidth: 192,
       background: '#f0f0f0',
       borderRight: '1.5px solid #cccccc',
       display: 'flex', flexDirection: 'column',
-      height: '100%', overflowY: 'auto',
-      padding: '8px 6px',
+      height: '100%', overflow: 'hidden',
     }}>
-      {/* User profile */}
+
+      {/* ── Zone 1: User profile with colour picker ── */}
       <div style={{
-        ...cardStyle('#aaaacc'),
-        display: 'flex', alignItems: 'center', gap: 8,
-        padding: '8px 10px', marginBottom: 8,
+        flexShrink: 0,
+        background: zoneBg,
+        borderBottom: `2px solid ${avatarColor}`,
+        padding: '7px 10px 5px',
       }}>
-        <div style={{
-          width: 30, height: 30, borderRadius: '50%',
-          background: '#dde8f8', border: '1.5px solid #6699cc',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 9, color: '#336699', fontWeight: 'bold', flexShrink: 0,
-        }}>DR</div>
-        <div>
-          <div style={{ fontSize: 9, color: '#222', fontWeight: 'bold' }}>Dr. Radiologist</div>
-          <div style={{ fontSize: 8, color: '#666' }}>Nuclear Medicine</div>
-        </div>
-      </div>
-
-      {/* Current Study — patient header */}
-      <div style={cardStyle('#6699cc')}>
-        <div
-          style={cardHeaderStyle('#6699cc')}
-          onClick={() => setSeriesPanelOpen(v => !v)}
-        >
-          <span>Current Study</span>
-          <span style={{ fontSize: 9, color: '#aaa' }}>{seriesPanelOpen ? '▲' : '▼'}</span>
-        </div>
-        <div style={{ ...cardBodyStyle(), padding: '6px 8px' }}>
-          {/* Static patient header — will be replaced by real onMetaLoaded data in Phase 5 */}
-          <div style={{ fontSize: 9, color: '#2255aa', fontWeight: 'bold', marginBottom: 2 }}>ALKA JAGTAP</div>
-          <div style={{ fontSize: 8, color: '#444', marginBottom: 1 }}>PET-CT Whole Body</div>
-          <div style={{ fontSize: 8, color: '#666', marginBottom: 1 }}>28 Jan 2026 · F · 52y</div>
-          <div style={{ fontSize: 8, color: '#888', marginBottom: 4 }}>Tata Memorial Hospital</div>
-
-          {/* Drag hint */}
-          {seriesPanelOpen && (
-            <div style={{
-              fontSize: 7, color: '#6699cc', padding: '3px 5px',
-              background: '#eef3ff', border: '1px dashed #aabbd8',
-              borderRadius: 3, marginBottom: 6, lineHeight: 1.5,
-            }}>
-              ⇢ Drag <b>CT</b> → CT·Axial<br/>
-              ⇢ Drag <b>PET</b> → PET·Axial
-            </div>
-          )}
-
-          {/* Series list */}
-          {seriesPanelOpen && (
-            <SeriesPanel studyUID={STUDY_UID} />
-          )}
-        </div>
-      </div>
-
-      {/* Worklist */}
-      <Card title="Worklist" color="#7799bb" defaultOpen={true}>
-        <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
-          <div style={{ flex: 1, padding: '4px 6px', background: '#f8f8f8', border: '1px solid #ccc', borderRadius: 3, fontSize: 8, color: '#888' }}>
-            🔍 Search...
+        {/* Avatar + name row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+          <div style={{
+            width: 30, height: 30, borderRadius: '50%',
+            background: avatarColor,
+            border: `2px solid ${avatarColor}`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 10, color: '#fff', fontWeight: 'bold', flexShrink: 0,
+          }}>DR</div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 9, color: '#111', fontWeight: 'bold' }}>Dr. Radiologist</div>
+            <div style={{ fontSize: 8, color: '#444' }}>Nuclear Medicine</div>
           </div>
-          <button style={{ padding: '4px 7px', background: '#f0f4ff', border: '1px solid #99aacc', borderRadius: 3, fontSize: 10, cursor: 'pointer', color: '#336' }} title="Refresh worklist">⟳</button>
         </div>
-        {[
-          { name: 'ALKA JAGTAP',     date: '28 Jan 26', type: 'PET-CT' },
-          { name: 'SURESH KUMAR',    date: '27 Jan 26', type: 'CT' },
-          { name: 'PRIYA MEHTA',     date: '26 Jan 26', type: 'PET-CT' },
-        ].map((p, i) => (
-          <div key={i} style={{
-            padding: '4px 6px', marginBottom: 2,
-            background: i === 0 ? '#dde8f8' : '#f8f8f8',
-            border: `1px solid ${i === 0 ? '#99aacc' : '#ddd'}`,
-            borderRadius: 3, cursor: 'pointer',
-          }}>
-            <div style={{ fontSize: 8, color: '#222', fontWeight: i === 0 ? 'bold' : 'normal' }}>{p.name}</div>
-            <div style={{ fontSize: 7, color: '#888' }}>{p.date} · {p.type}</div>
-          </div>
-        ))}
-      </Card>
-
-      {/* Display Layout */}
-      <Card title="Display Layout" color="#9988bb">
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4 }}>
-          {LAYOUT_PRESETS.map(p => (
-            <div key={p.id} onClick={() => onLayoutChange(p.id)}
+        {/* Colour swatches */}
+        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+          <span style={{ fontSize: 7, color: '#666', marginRight: 1 }}>Theme</span>
+          {AVATAR_SWATCHES.map(sw => (
+            <div
+              key={sw.color}
+              title={sw.label}
+              onClick={() => setAvatarColor(sw.color)}
               style={{
-                padding: '4px 2px', textAlign: 'center', cursor: 'pointer',
-                background: layout === p.id ? '#ddeeff' : '#f8f8f8',
-                border: `1.5px solid ${layout === p.id ? '#6699cc' : '#ddd'}`,
-                borderRadius: 3, display: 'flex', flexDirection: 'column',
-                alignItems: 'center', gap: 2,
+                width: 14, height: 14, borderRadius: '50%',
+                background: sw.color,
+                border: avatarColor === sw.color
+                  ? `2px solid #fff`
+                  : '2px solid transparent',
+                outline: avatarColor === sw.color ? `2px solid ${sw.color}` : 'none',
+                cursor: 'pointer',
+                flexShrink: 0,
               }}
-              onMouseEnter={e => { if (layout !== p.id) e.currentTarget.style.background = '#eef2ff' }}
-              onMouseLeave={e => { if (layout !== p.id) e.currentTarget.style.background = '#f8f8f8' }}
-            >
-              <LayoutIcon id={p.id} active={layout === p.id} />
-              <div style={{ fontSize: 7, color: layout === p.id ? '#336699' : '#666', lineHeight: 1 }}>{p.label}</div>
-            </div>
+            />
           ))}
         </div>
-      </Card>
-
-      {/* Save & Export */}
-      <Card title="Save & Export" color="#77aa88" defaultOpen={false}>
-        {[
-          { icon: '🖼', label: 'Save viewport (PNG)' },
-          { icon: '📁', label: 'Save all viewports' },
-          { icon: '🎬', label: 'Export MIP video' },
-          { icon: '🎞', label: 'Export cine scroll' },
-        ].map(({ icon, label }) => (
-          <div key={label} style={{
-            display: 'flex', alignItems: 'center', gap: 6,
-            padding: '6px 8px', marginBottom: 3,
-            background: '#f8f8f8', border: '1px solid #ddd', borderRadius: 3,
-            fontSize: 10, color: '#222', cursor: 'pointer',
-          }}
-            onMouseEnter={e => e.currentTarget.style.background = '#eef8ee'}
-            onMouseLeave={e => e.currentTarget.style.background = '#f8f8f8'}
-          ><span style={{ fontSize: 18 }}>{icon}</span><span style={{ fontSize: 10 }}>{label}</span></div>
-        ))}
-      </Card>
-
-      {/* Fusion alignment */}
-      <div style={{
-        border: '1.5px solid #557755',
-        borderRadius: 5,
-        background: '#0d1a0d',
-        marginBottom: 8,
-        overflow: 'hidden',
-      }}>
-        <div style={{
-          padding: '6px 10px',
-          background: '#0a150a',
-          borderBottom: '1px solid #334433',
-          fontSize: 10, fontWeight: 'bold',
-          color: fusionMode === 'manual' ? '#ffee44' : '#88dd88',
-          textTransform: 'uppercase', letterSpacing: 1,
-          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        }}>
-          <span>PET Fusion</span>
-          {fusionFixed && <span style={{ fontSize: 8, color: '#ffcc44' }}>FIXED</span>}
-        </div>
-        <FusionPanel
-          fusionMode={fusionMode}
-          fusionOffset={fusionOffset}
-          fusionFixed={fusionFixed}
-          onModeChange={onFusionModeChange}
-          onOffsetChange={onFusionOffsetChange}
-          onFixRequest={onFixRequest}
-          onReset={onFusionReset}
-        />
       </div>
 
-      {/* Print Layout */}
-      <PrintLayoutCard />
+      {/* ── Zone 2: Tab-card list — scrolls vertically ── */}
+      <div style={{
+        flex: 1, minHeight: 0,
+        overflowY: 'auto', overflowX: 'hidden',
+        scrollbarWidth: 'thin', scrollbarColor: '#bbb #f0f0f0',
+      }}>
 
-      {/* Display */}
-      <Card title="Display" color="#aa8877" defaultOpen={false}>
-        {[
-          { icon: '⚙', label: 'Image settings' },
-          { icon: '📋', label: 'Hanging protocol' },
-          { icon: '🎨', label: 'UI theme' },
-        ].map(({ icon, label }) => (
-          <div key={label} style={{
-            display: 'flex', alignItems: 'center', gap: 6,
-            padding: '6px 8px', marginBottom: 3,
-            background: '#f8f8f8', border: '1px solid #ddd', borderRadius: 3,
-            fontSize: 10, color: '#222', cursor: 'pointer',
-          }}
-            onMouseEnter={e => e.currentTarget.style.background = '#fff4f0'}
-            onMouseLeave={e => e.currentTarget.style.background = '#f8f8f8'}
-          ><span style={{ fontSize: 18 }}>{icon}</span><span style={{ fontSize: 10 }}>{label}</span></div>
-        ))}
-      </Card>
+        {/* Current Study */}
+        <TabCard label="Current Study" color="#185fa5" maxHeight={260}
+          selected={selectedCard === 'Current Study'} onSelect={setSelectedCard}>
+          <div style={{ fontSize: 9, color: '#2255aa', fontWeight: 'bold', marginBottom: 2 }}>Alka Jagtap</div>
+          <div style={{ fontSize: 8, color: '#444', marginBottom: 1 }}>PET-CT Whole Body</div>
+          <div style={{ fontSize: 8, color: '#666', marginBottom: 1 }}>28 Jan 2026 · F · 52y</div>
+          <div style={{ fontSize: 8, color: '#888', marginBottom: 5 }}>Tata Memorial Hospital</div>
+          <div style={{
+            fontSize: 7, color: '#6699cc', padding: '2px 5px', lineHeight: 1.5,
+            background: '#eef3ff', border: '1px dashed #aabbd8', borderRadius: 3, marginBottom: 5,
+          }}>⇢ Drag <b>CT</b> → CT·Axial &nbsp;·&nbsp; ⇢ Drag <b>PET</b> → PET·Axial</div>
+          <SeriesPanel studyUID={STUDY_UID} />
+        </TabCard>
 
-      {/* Sign out */}
-      <div style={{ marginTop: 'auto', paddingTop: 4 }}>
+        {/* Worklist */}
+        <TabCard label="Worklist" color="#378add" maxHeight={150}
+          selected={selectedCard === 'Worklist'} onSelect={setSelectedCard}>
+          <div style={{ display: 'flex', gap: 3, marginBottom: 5 }}>
+            <div style={{ flex: 1, padding: '3px 5px', background: '#f8f8f8', border: '1px solid #ccc', borderRadius: 3, fontSize: 8, color: '#888' }}>🔍 Search…</div>
+            <div style={{ padding: '3px 7px', background: '#f0f4ff', border: '1px solid #99aacc', borderRadius: 3, fontSize: 10, cursor: 'pointer', color: '#336699' }}>⟳</div>
+          </div>
+          {[
+            { name: 'Alka Jagtap',  date: '28 Jan', type: 'PET-CT', active: true },
+            { name: 'Suresh Kumar', date: '27 Jan', type: 'CT',     active: false },
+            { name: 'Priya Mehta',  date: '26 Jan', type: 'PET-CT', active: false },
+          ].map((p, i) => (
+            <div key={i} style={{
+              padding: '3px 5px', marginBottom: 2, borderRadius: 3, cursor: 'pointer',
+              background: p.active ? '#dde8f8' : '#f8f8f8',
+              border: `1px solid ${p.active ? '#99aacc' : '#ddd'}`,
+            }}>
+              <div style={{ fontSize: 8, color: p.active ? '#0c447c' : '#222', fontWeight: p.active ? 'bold' : 'normal' }}>{p.name}</div>
+              <div style={{ fontSize: 7, color: p.active ? '#185fa5' : '#888' }}>{p.date} · {p.type}</div>
+            </div>
+          ))}
+        </TabCard>
+
+        {/* Display Layout */}
+        <TabCard label="Display Layout" color="#534ab7" maxHeight={190}
+          selected={selectedCard === 'Display Layout'} onSelect={setSelectedCard}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 3 }}>
+            {LAYOUT_PRESETS.map(p => (
+              <div key={p.id} onClick={() => onLayoutChange(p.id)}
+                style={{
+                  padding: '4px 2px', textAlign: 'center', cursor: 'pointer',
+                  background: layout === p.id ? '#ddeeff' : '#f8f8f8',
+                  border: `1.5px solid ${layout === p.id ? '#6699cc' : '#ddd'}`,
+                  borderRadius: 3, display: 'flex', flexDirection: 'column',
+                  alignItems: 'center', gap: 2,
+                  transition: 'background 0.1s',
+                }}
+                onMouseEnter={e => { if (layout !== p.id) e.currentTarget.style.background = '#eef2ff'; }}
+                onMouseLeave={e => { if (layout !== p.id) e.currentTarget.style.background = '#f8f8f8'; }}
+              >
+                <LayoutIcon id={p.id} active={layout === p.id} />
+                <div style={{ fontSize: 7, color: layout === p.id ? '#336699' : '#666', lineHeight: 1 }}>{p.label}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 4, fontSize: 7, color: '#999', lineHeight: 1.4 }}>
+            Hover a viewport box → ⚙ to reassign what's shown in it.
+          </div>
+        </TabCard>
+
+        {/* Save & Export */}
+        <TabCard label="Save & Export" color="#0f6e56" maxHeight={150}
+          selected={selectedCard === 'Save & Export'} onSelect={setSelectedCard}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5 }}>
+            {[
+              { icon: '🖼', label: 'Save viewport', sub: 'PNG' },
+              { icon: '📁', label: 'Save all',      sub: 'viewports' },
+              { icon: '🎬', label: 'Export MIP',    sub: 'video' },
+              { icon: '🎞', label: 'Export cine',   sub: 'scroll' },
+            ].map(({ icon, label, sub }) => (
+              <div key={label} style={{
+                display: 'flex', flexDirection: 'column',
+                alignItems: 'center', justifyContent: 'center',
+                padding: '7px 4px', borderRadius: 5, cursor: 'pointer',
+                background: '#f4f7f4', border: '1px solid #c8ddd0',
+                gap: 3,
+              }}
+                onMouseEnter={e => { e.currentTarget.style.background = '#e0f0e8'; e.currentTarget.style.borderColor = '#0f6e56'; }}
+                onMouseLeave={e => { e.currentTarget.style.background = '#f4f7f4'; e.currentTarget.style.borderColor = '#c8ddd0'; }}
+              >
+                <span style={{ fontSize: 20, lineHeight: 1 }}>{icon}</span>
+                <span style={{ fontSize: 8, color: '#1a4a2a', fontWeight: 'bold', textAlign: 'center', lineHeight: 1.2 }}>{label}</span>
+                <span style={{ fontSize: 7, color: '#5a8a6a', textAlign: 'center', lineHeight: 1 }}>{sub}</span>
+              </div>
+            ))}
+          </div>
+        </TabCard>
+
+        {/* PET Fusion */}
+        <TabCard label="PET Fusion" color="#3b6d11" maxHeight={260}
+          labelExtra={fusionFixed ? <span style={{ fontSize: 7, color: '#ffcc44' }}>FIXED</span> : null}
+          selected={selectedCard === 'PET Fusion'} onSelect={setSelectedCard}>
+
+          {/* Mode selector — icon tiles side by side */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5, marginBottom: 8 }}>
+            {[
+              {
+                mode: 'auto',
+                label: 'Auto Fusion',
+                // Two overlapping concentric circles — auto alignment icon
+                icon: (
+                  <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+                    <circle cx="10" cy="14" r="7" stroke="currentColor" strokeWidth="1.8" fill="none" opacity="0.7"/>
+                    <circle cx="18" cy="14" r="7" stroke="currentColor" strokeWidth="1.8" fill="none" opacity="0.7"/>
+                    <path d="M14 8.5 C16.5 10 16.5 18 14 19.5 C11.5 18 11.5 10 14 8.5Z" fill="currentColor" opacity="0.35"/>
+                    {/* small arrows suggesting auto-snap */}
+                    <path d="M22 11 L24 13 L22 15" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                ),
+              },
+              {
+                mode: 'manual',
+                label: 'Manual Fusion',
+                // Hand/sliders icon — manual control
+                icon: (
+                  <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+                    {/* three horizontal slider lines */}
+                    <line x1="5" y1="9"  x2="23" y2="9"  stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" opacity="0.5"/>
+                    <line x1="5" y1="14" x2="23" y2="14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" opacity="0.5"/>
+                    <line x1="5" y1="19" x2="23" y2="19" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" opacity="0.5"/>
+                    {/* slider thumbs at different positions */}
+                    <circle cx="10" cy="9"  r="3" fill="currentColor" opacity="0.9"/>
+                    <circle cx="17" cy="14" r="3" fill="currentColor" opacity="0.9"/>
+                    <circle cx="13" cy="19" r="3" fill="currentColor" opacity="0.9"/>
+                  </svg>
+                ),
+              },
+            ].map(({ mode, label, icon }) => {
+              const active = fusionMode === mode
+              const col    = active ? '#3b6d11' : '#666'
+              return (
+                <div
+                  key={mode}
+                  onMouseDown={e => { e.stopPropagation(); onFusionModeChange(mode); }}
+                  style={{
+                    display: 'flex', flexDirection: 'column',
+                    alignItems: 'center', justifyContent: 'center',
+                    padding: '8px 4px', borderRadius: 5, cursor: 'pointer', gap: 4,
+                    background: active ? '#e8f5e0' : '#f4f7f4',
+                    border: `${active ? '2px' : '1px'} solid ${active ? '#3b6d11' : '#c8ddd0'}`,
+                    color: col,
+                  }}
+                  onMouseEnter={e => { if (!active) { e.currentTarget.style.background = '#edf5e8'; e.currentTarget.style.borderColor = '#7aaa55'; }}}
+                  onMouseLeave={e => { if (!active) { e.currentTarget.style.background = '#f4f7f4'; e.currentTarget.style.borderColor = '#c8ddd0'; }}}
+                >
+                  <span style={{ color: col, display: 'flex' }}>{icon}</span>
+                  <span style={{
+                    fontSize: 7, fontWeight: active ? 'bold' : 'normal',
+                    color: active ? '#1a4a0a' : '#446644',
+                    textAlign: 'center', lineHeight: 1.2,
+                  }}>{label}</span>
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Sliders + fix/reset from FusionPanel */}
+          <FusionPanel
+            fusionMode={fusionMode} fusionOffset={fusionOffset} fusionFixed={fusionFixed}
+            onModeChange={onFusionModeChange} onOffsetChange={onFusionOffsetChange}
+            onFixRequest={onFixRequest} onReset={onFusionReset}
+          />
+        </TabCard>
+
+        {/* Print */}
+        <TabCard label="Print / PDF" color="#993c1d" maxHeight={200}
+          selected={selectedCard === 'Print / PDF'} onSelect={setSelectedCard}>
+
+          {/* Primary actions — icon tiles */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5, marginBottom: 8 }}>
+            {[
+              {
+                label: 'Print', sub: 'layout',
+                icon: (
+                  <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
+                    <rect x="5" y="8" width="16" height="11" rx="2" stroke="currentColor" strokeWidth="1.8" fill="none"/>
+                    <rect x="8" y="4" width="10" height="5" rx="1" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+                    <rect x="8" y="15" width="10" height="6" rx="1" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+                    <circle cx="19" cy="12" r="1.2" fill="currentColor"/>
+                  </svg>
+                ),
+                onClick: () => window.print(),
+              },
+              {
+                label: 'Layout', sub: 'designer',
+                icon: (
+                  <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
+                    <rect x="3" y="3" width="9" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.8" fill="none"/>
+                    <rect x="14" y="3" width="9" height="4" rx="1.5" stroke="currentColor" strokeWidth="1.8" fill="none"/>
+                    <rect x="14" y="9" width="9" height="4" rx="1.5" stroke="currentColor" strokeWidth="1.8" fill="none"/>
+                    <rect x="3" y="14" width="20" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.8" fill="none"/>
+                  </svg>
+                ),
+                onClick: null,
+              },
+              {
+                label: 'Save PDF', sub: 'report',
+                icon: (
+                  <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
+                    <rect x="5" y="3" width="14" height="18" rx="2" stroke="currentColor" strokeWidth="1.8" fill="none"/>
+                    <path d="M15 3 L21 9 L15 9 Z" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+                    <line x1="8" y1="13" x2="18" y2="13" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+                    <line x1="8" y1="16" x2="15" y2="16" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+                    <text x="7" y="11" fontSize="5" fill="currentColor" fontWeight="bold">PDF</text>
+                  </svg>
+                ),
+                onClick: null,
+              },
+              {
+                label: 'Share', sub: '/ send',
+                icon: (
+                  <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
+                    <circle cx="19" cy="6"  r="3" stroke="currentColor" strokeWidth="1.8" fill="none"/>
+                    <circle cx="7"  cy="13" r="3" stroke="currentColor" strokeWidth="1.8" fill="none"/>
+                    <circle cx="19" cy="20" r="3" stroke="currentColor" strokeWidth="1.8" fill="none"/>
+                    <line x1="10" y1="11.5" x2="16" y2="7.5"  stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                    <line x1="10" y1="14.5" x2="16" y2="18.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                  </svg>
+                ),
+                onClick: null,
+              },
+            ].map(({ label, sub, icon, onClick }) => (
+              <div key={label}
+                onMouseDown={e => { e.stopPropagation(); onClick?.(); }}
+                style={{
+                  display: 'flex', flexDirection: 'column',
+                  alignItems: 'center', justifyContent: 'center',
+                  padding: '7px 4px', borderRadius: 5, cursor: 'pointer', gap: 3,
+                  background: '#fdf5f2', border: '1px solid #e0c0b0', color: '#7a2a0a',
+                }}
+                onMouseEnter={e => { e.currentTarget.style.background = '#f8e8e0'; e.currentTarget.style.borderColor = '#993c1d'; }}
+                onMouseLeave={e => { e.currentTarget.style.background = '#fdf5f2'; e.currentTarget.style.borderColor = '#e0c0b0'; }}
+              >
+                <span style={{ color: '#993c1d', display: 'flex' }}>{icon}</span>
+                <span style={{ fontSize: 8, fontWeight: 'bold', color: '#5a1a08', textAlign: 'center', lineHeight: 1.2 }}>{label}</span>
+                <span style={{ fontSize: 7, color: '#aa6655', textAlign: 'center', lineHeight: 1 }}>{sub}</span>
+              </div>
+            ))}
+          </div>
+        </TabCard>
+
+        {/* Display */}
+        <TabCard label="Display" color="#5f5e5a" maxHeight={120}
+          selected={selectedCard === 'Display'} onSelect={setSelectedCard}>
+          {[
+            { icon: '⚙', label: 'Image settings' },
+            { icon: '📋', label: 'Hanging protocol' },
+            { icon: '🎨', label: 'UI theme' },
+          ].map(({ icon, label }) => (
+            <div key={label} style={{
+              display: 'flex', alignItems: 'center', gap: 5,
+              padding: '4px 6px', marginBottom: 2, borderRadius: 3,
+              background: '#f8f8f8', border: '1px solid #ddd', cursor: 'pointer', fontSize: 9, color: '#222',
+            }}
+              onMouseEnter={e => e.currentTarget.style.background = '#fff4f0'}
+              onMouseLeave={e => e.currentTarget.style.background = '#f8f8f8'}
+            ><span style={{ fontSize: 14 }}>{icon}</span>{label}</div>
+          ))}
+        </TabCard>
+
+      </div>{/* end Zone 2 */}
+
+      {/* ── Zone 3: Quick-access icon bar + sign out — always visible ── */}
+      <div style={{ flexShrink: 0, borderTop: '1px solid #ccc', background: '#e8e8e8' }}>
+        {/* Horizontal scrollable icon bar */}
         <div style={{
-          display: 'flex', alignItems: 'center', gap: 8,
-          padding: '8px 10px', fontSize: 11, color: '#111',
-          fontWeight: 'bold', cursor: 'pointer',
-          border: '1.5px solid #999', borderRadius: 3, background: '#f0f0f0',
-        }}
-          onMouseEnter={e => { e.currentTarget.style.background='#ffeeee'; e.currentTarget.style.color='#cc0000' }}
-          onMouseLeave={e => { e.currentTarget.style.background='#f0f0f0'; e.currentTarget.style.color='#111' }}
-        >
-          <span style={{ fontSize: 18 }}>⎋</span>
-          <span>Sign out</span>
+          display: 'flex', gap: 3, padding: '4px 6px',
+          overflowX: 'auto', overflowY: 'hidden',
+          scrollbarWidth: 'thin', scrollbarColor: '#bbb #e8e8e8',
+          borderBottom: '1px solid #d0d0d0',
+        }}>
+          {[
+            { icon: '🖼', tip: 'Save PNG' }, { icon: '🎬', tip: 'Export MIP' },
+            { icon: '🖨', tip: 'Print' },    { icon: '📐', tip: 'Layout' },
+            { icon: '⚙',  tip: 'Settings' }, { icon: '🔍', tip: 'Search' },
+            { icon: '📊', tip: 'Stats' },    { icon: '💾', tip: 'Save' },
+          ].map(({ icon, tip }) => (
+            <div key={tip} title={tip} style={{
+              width: 24, height: 24, flexShrink: 0, borderRadius: 3,
+              background: '#e0e0e0', border: '1px solid #ccc',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 13, cursor: 'pointer',
+            }}
+              onMouseEnter={e => e.currentTarget.style.background = '#d0d8f0'}
+              onMouseLeave={e => e.currentTarget.style.background = '#e0e0e0'}
+            >{icon}</div>
+          ))}
         </div>
+        {/* Sign out */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 7,
+          padding: '7px 10px', fontSize: 11, color: '#222',
+          fontWeight: 'bold', cursor: 'pointer',
+          borderTop: '1px solid #d8d8d8',
+        }}
+          onMouseEnter={e => { e.currentTarget.style.background = '#ffeeee'; e.currentTarget.style.color = '#cc0000'; }}
+          onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = '#222'; }}
+        >
+          <span style={{ fontSize: 15 }}>⎋</span> Sign out
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── TabCard — telephone-index style card ─────────────────────────────────────
+// • No collapse. Content always visible.
+// • Click anywhere → onSelect(label) → neon border on that card.
+// • Neon uses outline (not border) so it is never clipped by parent overflow.
+//   outline renders outside the border-box and is unaffected by ancestor
+//   overflow:hidden/auto containers.
+// • Scrollbar stays inside: content div has paddingRight so the scrollbar
+//   track occupies the padding area, always inside the card frame.
+function TabCard({ label, color, children, maxHeight = 200, labelExtra, selected, onSelect }) {
+  return (
+    <div
+      onMouseDown={() => onSelect?.(label)}
+      style={{
+        display: 'flex',
+        border: '1px solid #d0d0d0',
+        // outline renders outside the border-box, never clipped by overflow containers
+        outline: selected ? `2px solid ${color}` : 'none',
+        outlineOffset: '-1px',   // inset 1px so it aligns with the border edge
+        background: '#fff',
+        position: 'relative',
+        zIndex: selected ? 2 : 0,
+        cursor: 'default',
+        marginBottom: '1px',
+      }}
+    >
+      {/* Vertical label strip — always visible */}
+      <div style={{
+        width: 20, minWidth: 20, flexShrink: 0,
+        background: color,
+        display: 'flex', flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'flex-start',
+        borderRight: '1px solid rgba(0,0,0,0.15)',
+        paddingTop: 6, paddingBottom: 4,
+        cursor: 'pointer',
+      }}>
+        <span style={{
+          writingMode: 'vertical-rl',
+          textOrientation: 'mixed',
+          transform: 'rotate(180deg)',
+          fontSize: 8, fontWeight: 'bold',
+          letterSpacing: 0.9,
+          textTransform: 'uppercase',
+          color: '#fff',
+          whiteSpace: 'nowrap',
+          userSelect: 'none',
+        }}
+          dangerouslySetInnerHTML={{ __html: label }}
+        />
+        {labelExtra && <div style={{ marginTop: 4 }}>{labelExtra}</div>}
+      </div>
+
+      {/* Content — always fully rendered */}
+      <div style={{
+        flex: 1, minWidth: 0,
+        maxHeight,
+        overflowY: 'auto',
+        overflowX: 'hidden',
+        // paddingRight leaves room for the scrollbar so it sits inside the outline.
+        // The thin scrollbar is ~8px; 10px padding gives 2px breathing room.
+        paddingTop: '7px',
+        paddingBottom: '7px',
+        paddingLeft: '8px',
+        paddingRight: '10px',
+        boxSizing: 'border-box',
+        scrollbarWidth: 'thin',
+        scrollbarColor: `${color}88 #f0f0f0`,
+      }}>
+        {children}
       </div>
     </div>
   )
@@ -787,56 +1045,179 @@ function PatientBanner() {
 }
 
 // ─── Right Panel ──────────────────────────────────────────────────────────────
+// Same telephone-index tab design as the left panel.
+// When collapsed: only the coloured tab strips are visible (20px wide each),
+// giving a visual cue of what's inside without taking space.
 function RightPanel({ collapsed, onToggle }) {
+  const [avatarColor,  setAvatarColor]  = useState('#0f6e56')
+  const [selectedCard, setSelectedCard] = useState('Report')
+
+  const AVATAR_SWATCHES = [
+    { color: '#185fa5', label: 'Blue'   },
+    { color: '#0f6e56', label: 'Teal'   },
+    { color: '#534ab7', label: 'Purple' },
+    { color: '#993c1d', label: 'Coral'  },
+    { color: '#3b6d11', label: 'Green'  },
+    { color: '#885533', label: 'Brown'  },
+  ]
+
   return (
     <div style={{
-      width: collapsed ? 18 : 195,
-      minWidth: collapsed ? 18 : 195,
+      width: collapsed ? 22 : 200,
+      minWidth: collapsed ? 22 : 200,
       background: '#f0f0f0',
       borderLeft: '1.5px solid #cccccc',
       display: 'flex', flexDirection: 'column',
       transition: 'width 0.15s ease',
       overflow: 'hidden', position: 'relative',
     }}>
-      <button onClick={onToggle} style={{
-        position: 'absolute', left: 0, top: '50%',
-        transform: 'translateY(-50%)',
-        background: '#e8e8e8', border: '1px solid #bbb', borderLeft: 'none',
-        color: '#666', fontSize: 9, cursor: 'pointer',
-        padding: '10px 3px', borderRadius: '0 3px 3px 0', zIndex: 10,
-      }}>{collapsed ? '◀' : '▶'}</button>
+      {/* Collapse/expand toggle — always visible at top */}
+      <div style={{
+        flexShrink: 0,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: '5px 0',
+        borderBottom: '1px solid #d0d0d0',
+        background: '#e8e8e8',
+        cursor: 'pointer',
+      }} onClick={onToggle} title={collapsed ? 'Expand panel' : 'Collapse panel'}>
+        <span style={{ fontSize: 11, color: '#555' }}>{collapsed ? '◀' : '▶'}</span>
+      </div>
 
-      {!collapsed && (
-        <div style={{ padding: '8px 8px 8px 22px', flex: 1, overflowY: 'auto' }}>
-          <Card title="Structured Report" color="#7799aa">
-            {['Clinical history','Technique','Findings','Impression','Recommendation'].map(s => (
-              <div key={s} style={{ marginBottom: 6 }}>
-                <div style={{ fontSize: 8, color: '#555', marginBottom: 2, fontWeight: 'bold' }}>{s}</div>
-                <textarea rows={s === 'Findings' ? 4 : 2}
-                  placeholder={`Enter ${s.toLowerCase()}...`}
-                  style={{
-                    width: '100%', background: '#fafafa',
-                    border: '1px solid #ccc', borderRadius: 3,
-                    color: '#222', fontSize: 8, padding: '3px 5px',
-                    resize: 'vertical', fontFamily: 'monospace',
-                    boxSizing: 'border-box',
-                  }} />
-              </div>
-            ))}
-          </Card>
-
-          <Card title="SUV Measurements" color="#99aa77">
-            <div style={{ fontSize: 8, color: '#888', fontStyle: 'italic' }}>
-              No ROIs placed yet
+      {collapsed ? (
+        /* Collapsed state: show tab strips only, stacked vertically */
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflowY: 'auto' }}>
+          {[
+            { label: 'Report',   color: '#185fa5' },
+            { label: 'SUV',      color: '#3b6d11' },
+            { label: 'History',  color: '#534ab7' },
+            { label: 'Actions',  color: '#993c1d' },
+          ].map(t => (
+            <div key={t.label} onClick={onToggle} title={`Expand to see ${t.label}`}
+              style={{
+                height: 70, background: t.color,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                borderBottom: '1px solid rgba(0,0,0,0.15)', cursor: 'pointer',
+              }}>
+              <span style={{
+                writingMode: 'vertical-rl', transform: 'rotate(180deg)',
+                fontSize: 8, fontWeight: 'bold', letterSpacing: 0.9,
+                textTransform: 'uppercase', color: '#fff', whiteSpace: 'nowrap',
+                userSelect: 'none',
+              }}>{t.label}</span>
             </div>
-          </Card>
+          ))}
+        </div>
+      ) : (
+        /* Expanded state: full tab-card layout */
+        <div style={{
+          flex: 1, minHeight: 0,
+          display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        }}>
+          {/* Doctor info strip — mirrors left panel */}
+          <div style={{
+            flexShrink: 0,
+            background: avatarColor + '18',
+            borderBottom: `2px solid ${avatarColor}`,
+            padding: '6px 9px 5px',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
+              <div style={{
+                width: 26, height: 26, borderRadius: '50%',
+                background: avatarColor,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 9, color: '#fff', fontWeight: 'bold', flexShrink: 0,
+              }}>DR</div>
+              <div>
+                <div style={{ fontSize: 9, color: '#111', fontWeight: 'bold' }}>Dr. Radiologist</div>
+                <div style={{ fontSize: 8, color: '#444' }}>Reporting panel</div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <span style={{ fontSize: 7, color: '#666', marginRight: 1 }}>Theme</span>
+              {AVATAR_SWATCHES.map(sw => (
+                <div key={sw.color} title={sw.label} onClick={() => setAvatarColor(sw.color)}
+                  style={{
+                    width: 13, height: 13, borderRadius: '50%',
+                    background: sw.color, cursor: 'pointer', flexShrink: 0,
+                    border: avatarColor === sw.color ? '2px solid #fff' : '2px solid transparent',
+                    outline: avatarColor === sw.color ? `2px solid ${sw.color}` : 'none',
+                  }} />
+              ))}
+            </div>
+          </div>
 
-          <div style={{ marginTop: 6 }}>
-            <div style={{
-              padding: '6px 8px', background: '#ddeeff',
-              border: '1px solid #99aacc', borderRadius: 3,
-              fontSize: 8, color: '#336699', cursor: 'pointer', textAlign: 'center',
-            }}>Open full report editor ↗</div>
+          {/* Scrollable tab-card area */}
+          <div style={{
+            flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden',
+            scrollbarWidth: 'thin', scrollbarColor: '#bbb #f0f0f0',
+          }}>
+
+            {/* Structured Report */}
+            <TabCard label="Report" color="#185fa5" maxHeight={320}
+              selected={selectedCard === 'Report'} onSelect={setSelectedCard}>
+              {['Clinical history', 'Technique', 'Findings', 'Impression', 'Recommendation'].map(s => (
+                <div key={s} style={{ marginBottom: 6 }}>
+                  <div style={{ fontSize: 8, color: '#444', marginBottom: 2, fontWeight: 'bold' }}>{s}</div>
+                  <textarea rows={s === 'Findings' ? 4 : 2}
+                    placeholder={`Enter ${s.toLowerCase()}…`}
+                    style={{
+                      width: '100%', background: '#fafafa',
+                      border: '1px solid #ccc', borderRadius: 3,
+                      color: '#222', fontSize: 8, padding: '3px 5px',
+                      resize: 'vertical', fontFamily: 'monospace',
+                      boxSizing: 'border-box',
+                    }} />
+                </div>
+              ))}
+            </TabCard>
+
+            {/* SUV Measurements */}
+            <TabCard label="SUV" color="#3b6d11" maxHeight={180}
+              selected={selectedCard === 'SUV'} onSelect={setSelectedCard}>
+              <div style={{ fontSize: 8, color: '#888', fontStyle: 'italic', marginBottom: 8 }}>
+                No ROIs placed yet
+              </div>
+              <div style={{ fontSize: 7, color: '#666', lineHeight: 1.6 }}>
+                Draw a Circle ROI or Ellipse ROI on any PET-CT viewport to compute SUV max, mean, and peak automatically.
+              </div>
+            </TabCard>
+
+            {/* Clinical History */}
+            <TabCard label="History" color="#534ab7" maxHeight={140}
+              selected={selectedCard === 'History'} onSelect={setSelectedCard}>
+              {['Diagnosis', 'Prior studies', 'Medications'].map(f => (
+                <div key={f} style={{ marginBottom: 5 }}>
+                  <div style={{ fontSize: 8, color: '#444', fontWeight: 'bold', marginBottom: 2 }}>{f}</div>
+                  <textarea rows={2} placeholder={`${f}…`} style={{
+                    width: '100%', background: '#fafafa', border: '1px solid #ccc',
+                    borderRadius: 3, color: '#222', fontSize: 8, padding: '3px 5px',
+                    resize: 'vertical', fontFamily: 'monospace', boxSizing: 'border-box',
+                  }} />
+                </div>
+              ))}
+            </TabCard>
+
+            {/* Actions */}
+            <TabCard label="Actions" color="#993c1d" maxHeight={140}
+              selected={selectedCard === 'Actions'} onSelect={setSelectedCard}>
+              {[
+                { icon: '↗', label: 'Open full report editor' },
+                { icon: '📤', label: 'Send to referring physician' },
+                { icon: '📄', label: 'Generate PDF report' },
+                { icon: '💾', label: 'Save draft' },
+              ].map(({ icon, label }) => (
+                <div key={label} style={{
+                  display: 'flex', alignItems: 'center', gap: 5,
+                  padding: '4px 6px', marginBottom: 2, borderRadius: 3,
+                  background: '#f8f8f8', border: '1px solid #ddd',
+                  cursor: 'pointer', fontSize: 9, color: '#222',
+                }}
+                  onMouseEnter={e => e.currentTarget.style.background = '#fff0ec'}
+                  onMouseLeave={e => e.currentTarget.style.background = '#f8f8f8'}
+                ><span style={{ fontSize: 13 }}>{icon}</span>{label}</div>
+              ))}
+            </TabCard>
+
           </div>
         </div>
       )}
@@ -877,6 +1258,7 @@ function StatusBar({ ctWL, petWL, suv, sync, activeTool }) {
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [layout,          setLayout]          = useState('2x3mip')
+  const [boxAssignments,  setBoxAssignments]  = useState(null)
   const [ctWL,            setCTWL]            = useState(DEF_CT_WL)
   const [petWL,           setPETWL]           = useState(DEF_PET_WL)
   const [suv,             setSUV]             = useState(DEF_SUV)
@@ -893,6 +1275,20 @@ export default function App() {
   const [showShortcuts,   setShowShortcuts]   = useState(false)
 
   const onSync   = useCallback((key, val) => setSync(p => ({ ...p, [key]: val })), [])
+
+  const handleLayoutChange = useCallback((id) => {
+    setLayout(id);
+    setBoxAssignments(null);  // reset per-slot overrides when layout changes
+  }, [])
+
+  const handleBoxAssign = useCallback((slotIdx, vpKey) => {
+    setBoxAssignments(prev => {
+      const layoutDef = LAYOUT_DEFS[layout] || LAYOUT_DEFS['2x3mip'];
+      const base = prev ? [...prev] : layoutDef.slots.map(s => s.vpKey);
+      base[slotIdx] = vpKey;
+      return base;
+    });
+  }, [layout])
   const onFusionReset = useCallback(() => {
     setFusionOffset({ tx:0, ty:0, tz:0, rx:0, ry:0, rz:0 })
     setFusionFixed(false)
@@ -975,7 +1371,7 @@ export default function App() {
 
       {/* Left panel — full height from top */}
       <LeftPanel
-        layout={layout} onLayoutChange={setLayout}
+        layout={layout} onLayoutChange={handleLayoutChange}
         fusionMode={fusionMode}
         fusionOffset={fusionOffset}
         fusionFixed={fusionFixed}
@@ -1022,6 +1418,9 @@ export default function App() {
                 fusionMode={fusionMode}
                 fusionOffset={fusionOffset}
                 fusionFixed={fusionFixed}
+                layout={layout}
+                boxAssignments={boxAssignments}
+                onBoxAssign={handleBoxAssign}
               />
             </div>
             <StatusBar ctWL={ctWL} petWL={petWL} suv={suv} sync={sync} activeTool={activeTool} />

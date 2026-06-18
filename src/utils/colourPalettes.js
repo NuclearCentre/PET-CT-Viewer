@@ -119,21 +119,27 @@ export function registerCornerstonePalettes(cornerstoneCore) {
     //   RGBPoints: flat array [x, r, g, b, ...] with r/g/b in 0-1 range
     //   x is scalar value (remapped to data range by setMappingRange after)
 
+    let registered = 0;
     PALETTES.forEach(p => {
-      const registryName = `petct_${p.id}`;
-      const RGBPoints = [];
-      for (let i = 0; i < 256; i++) {
-        const [r, g, b] = getColor(p.id, i / 255);
-        RGBPoints.push(i, r / 255, g / 255, b / 255);
+      try {
+        const registryName = `petct_${p.id}`;
+        const RGBPoints = [];
+        for (let i = 0; i < 256; i++) {
+          const [r, g, b] = getColor(p.id, i / 255);
+          RGBPoints.push(i, r / 255, g / 255, b / 255);
+        }
+        utilities.colormap.registerColormap({
+          Name:       registryName,
+          ColorSpace: 'RGB',
+          RGBPoints,
+        });
+        registered++;
+      } catch(e) {
+        console.warn(`[colourPalettes] Failed to register ${p.id}:`, e?.message);
       }
-      utilities.colormap.registerColormap({
-        Name:       registryName,
-        ColorSpace: 'RGB',
-        RGBPoints,
-      });
     });
 
-    console.log('[colourPalettes] Registered 13 palettes (Name+RGBPoints format)');
+    console.log(`[colourPalettes] Registered ${registered}/13 palettes`);
   } catch(e) {
     console.error('[colourPalettes] Registration error:', e);
   }
