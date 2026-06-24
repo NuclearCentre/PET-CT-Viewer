@@ -1,17 +1,15 @@
 /**
  * volumeManager.js — Phase 3 (MPR · Fusion · Crosshairs)
- * Session 9 — fixes applied:
- *   1. orientation forwarded to setCamera() in applyFusionVolumes
- *   2. colormapName guarded (falls back to 'petct_gray' if undefined)
- *   3. purgeVolumes tries 3 removal strategies (was silently failing in v2.1.16)
- *   4. _ensureVolume guards against stale cache entry before createAndCacheVolume
- *   5. Window.__csVolumeCache populated so ViewerBox can access voxelManager
+ * Session 8 — final. Canvas2D overlay (canvasFusion.js) handles colour.
  *
- * Strategy (confirmed working from Session 8):
- *   CT volume:      full opacity (0.99 — keeps VTK alpha-compositing active)
- *   PET VTK actor:  opacity 0.001 (nearly invisible)
- *   canvasFusion.js draws PET colour overlay on a Canvas2D canvas on top
- *   Blend slider:   controls Canvas2D alpha only — VTK opacity unchanged by slider
+ * Strategy:
+ *   CT volume: full opacity (0.99 keeps VTK alpha-compositing active).
+ *   PET volume VTK actor: opacity 0.001 (nearly invisible).
+ *   canvasFusion.js draws the PET colour overlay on a Canvas2D canvas.
+ *   The blend slider controls Canvas2D alpha only — VTK is not involved.
+ *
+ * This approach bypasses all VTK colormap rendering issues.
+ * CS3D still handles: pan, zoom, scroll, crosshairs, annotations.
  */
 
 import {
@@ -34,9 +32,6 @@ export const ORIENTATION = {
   coronal:  OrientationAxis.CORONAL,
   sagittal: OrientationAxis.SAGITTAL,
 };
-
-// Expose volume cache to ViewerBox for voxelManager access
-if (!window.__csVolumeCache) window.__csVolumeCache = {};
 
 // ─── Volume build / cache ──────────────────────────────────────────────────────
 const _volumePromises = { ct: null, pet: null };
@@ -71,32 +66,27 @@ async function _prefetchMetadata(imageIds, label) {
   await Promise.all(
     Array.from({ length: Math.min(PREFETCH_CONCURRENCY, imageIds.length) }, worker)
   );
-  console.log(`[volumeManager] ${label} prefetch done — ${ok} ok / ${failed} failed.`);
+  console.log(`[volumeManager] ${label} prefetch done -- ${ok} ok / ${failed} failed.`);
   return { ok, failed };
 }
 
-async function _ensureVolume(volumeId, imageIds, key, cacheKey) {
+async function _ensureVolume(volumeId, imageIds, key) {
   if (!imageIds || imageIds.length === 0) return null;
   if (_volumePromises[key]) return _volumePromises[key];
-
   _volumePromises[key] = (async () => {
     try {
-      // Guard: destroy any stale cache entry before creating a new volume
+      // Guard against stale cache entries left by a partially-failed purge.
+      // If a volume with this ID is still in the cache, destroy it first so
+      // createAndCacheVolume doesn't throw "volume already exists".
       try {
-        const stale = cache.getVolume(volumeId);
+        const stale = cache?.getVolume?.(volumeId);
         if (stale) {
-          console.log(`[volumeManager] Destroying stale cache entry for ${volumeId}`);
-          stale.destroy?.();
+          try { stale.destroy?.(); } catch(e) {}
+          try { cache?.removeVolumeLoadObject?.(volumeId); } catch(e) {}
         }
-      } catch {}
-
+      } catch(e) {}
       const volume = await volumeLoader.createAndCacheVolume(volumeId, { imageIds });
       volume.load();
-
-      // Expose voxelManager for canvasFusion.js slice data access
-      if (cacheKey) window.__csVolumeCache[cacheKey] = volume;
-
-      console.log(`[volumeManager] Volume created: ${volumeId} (${imageIds.length} frames)`);
       return volume;
     } catch (e) {
       _volumePromises[key] = null;
@@ -109,152 +99,117 @@ async function _ensureVolume(volumeId, imageIds, key, cacheKey) {
 export async function ensureVolumes(ctImageIds, petImageIds) {
   await _prefetchMetadata(ctImageIds,  'CT');
   await _prefetchMetadata(petImageIds, 'PET');
-
   let ctVolumeId = null, petVolumeId = null;
-  try {
-    if (await _ensureVolume(CT_VOLUME_ID,  ctImageIds,  'ct',  CT_VOLUME_ID))  ctVolumeId  = CT_VOLUME_ID;
-  } catch (e) { console.error('[volumeManager] CT volume build failed:', e?.message); }
-  try {
-    if (await _ensureVolume(PET_VOLUME_ID, petImageIds, 'pet', PET_VOLUME_ID)) petVolumeId = PET_VOLUME_ID;
-  } catch (e) { console.error('[volumeManager] PET volume build failed:', e?.message); }
-
+  try { if (await _ensureVolume(CT_VOLUME_ID,  ctImageIds,  'ct'))  ctVolumeId  = CT_VOLUME_ID;  }
+  catch (e) { console.error('[volumeManager] CT volume build failed:', e?.message); }
+  try { if (await _ensureVolume(PET_VOLUME_ID, petImageIds, 'pet')) petVolumeId = PET_VOLUME_ID; }
+  catch (e) { console.error('[volumeManager] PET volume build failed:', e?.message); }
   return { ctVolumeId, petVolumeId };
 }
 
 export function purgeVolumes() {
-  _volumePromises.ct  = null;
+  _volumePromises.ct = null;
   _volumePromises.pet = null;
-
-  // Clear voxelManager refs
-  delete window.__csVolumeCache[CT_VOLUME_ID];
-  delete window.__csVolumeCache[PET_VOLUME_ID];
-
-  // Try 3 removal strategies in order — v2.1.16 may or may not have each API
-  for (const vid of [CT_VOLUME_ID, PET_VOLUME_ID]) {
-    try { cache?.removeVolumeLoadObject?.(vid); } catch {}
-    try { cache?.getVolume?.(vid)?.destroy?.();  } catch {}
-    try { cache?.removeImageLoadObject?.(vid);   } catch {}
+  // Three removal strategies in priority order — v2.1.16 may not have all three.
+  // Any one succeeding is sufficient; failures are silently swallowed.
+  for (const volumeId of [CT_VOLUME_ID, PET_VOLUME_ID]) {
+    // Strategy 1: v2.x API
+    try { cache?.removeVolumeLoadObject?.(volumeId); } catch(e) {}
+    // Strategy 2: destroy via getVolume
+    try { cache?.getVolume?.(volumeId)?.destroy?.(); } catch(e) {}
+    // Strategy 3: image load object fallback
+    try { cache?.removeImageLoadObject?.(volumeId); } catch(e) {}
   }
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
-
 const voiFromWL = (wl) => ({
   lower: wl.wc - wl.ww / 2,
   upper: wl.wc + wl.ww / 2,
 });
 
-/** Map orientation string to CS3D OrientationAxis enum value */
-function _orientationEnum(orientation) {
-  switch (orientation) {
-    case 'coronal':  return OrientationAxis.CORONAL;
-    case 'sagittal': return OrientationAxis.SAGITTAL;
-    default:         return OrientationAxis.AXIAL;
-  }
-}
-
 // ─── CT-only MPR viewport ──────────────────────────────────────────────────────
-export async function applyCTVolume(vp, { wl, orientation, colormapName }) {
+export async function applyCTVolume(vp, { wl, colormapName }) {
   await vp.setVolumes([{ volumeId: CT_VOLUME_ID }]);
-
-  // Apply orientation BEFORE resetCamera so camera resets to the correct plane
-  try { vp.setCamera({ viewPlaneNormal: undefined }); } catch {}
-  try { vp.setOrientation(_orientationEnum(orientation)); } catch {}
-
   vp.resetCamera();
-
-  const cmName = colormapName || 'petct_gray';
   try {
-    vp.setProperties({ voiRange: voiFromWL(wl), colormap: { name: cmName } });
-  } catch {
+    vp.setProperties({ voiRange: voiFromWL(wl), colormap: { name: colormapName } });
+  } catch (e) {
     vp.setProperties({ voiRange: voiFromWL(wl) });
   }
   vp.render();
-  console.log(`[volumeManager] CT volume applied — ${orientation} — colormap: ${cmName}`);
 }
 
-// ─── PET-CT FUSION viewport ────────────────────────────────────────────────────
-/**
- * Apply CT + PET volumes to a fusion viewport.
- * CT is rendered grey at 0.99 opacity by CS3D VTK.
- * PET VTK actor is set to 0.001 opacity — Canvas2D draws the colour instead.
- *
- * CRITICAL: PET must be listed LAST in setVolumes so that
- * getCurrentSlicePixelData() returns PET data (not CT).
- */
-export async function applyFusionVolumes(vp, { ctWL, petWL, petColormapName, petOpacity, orientation }) {
-  // PET is LAST so getCurrentSlicePixelData() returns PET pixel data
-  await vp.setVolumes([
-    { volumeId: CT_VOLUME_ID  },
-    { volumeId: PET_VOLUME_ID },
-  ]);
-
-  // Apply orientation (Fix 2)
-  try { vp.setOrientation(_orientationEnum(orientation)); } catch {}
-
+// ─── PET-only viewport (bottom row) ──────────────────────────────────────────
+// Single PET volume only — single-arg setProperties, no two-volume compositing.
+// Avoids vtkPolyDataVS shader crash on Intel UHD 620 (Session 10 M3).
+// CT underlay deferred to a later session when GPU compatibility is resolved.
+export async function applyFusionVolumes(vp, { ctWL, petWL, petColormapName, petOpacity }) {
+  await vp.setVolumes([{ volumeId: PET_VOLUME_ID }]);
   vp.resetCamera();
-
-  // CT: grey colormap, real VOI, 0.99 opacity so VTK alpha-compositing is active
-  const ctMap = 'petct_gray';
-  try { vp.setProperties({ voiRange: voiFromWL(ctWL), colormap: { name: ctMap } }, CT_VOLUME_ID); } catch {}
-  try { vp.setProperties({ colormap: { opacity: 0.99 } }, CT_VOLUME_ID); } catch {}
-
-  // PET: nearly invisible VTK actor — Canvas2D handles colour
-  const petMap = petColormapName || 'petct_hot_iron';
-  try { vp.setProperties({ voiRange: voiFromWL(petWL), colormap: { name: petMap } }, PET_VOLUME_ID); } catch {}
-  try { vp.setProperties({ colormap: { opacity: 0.001 } }, PET_VOLUME_ID); } catch {}
-
-  console.log(`[volumeManager] Fusion applied — ${orientation} — CT grey + PET Canvas2D (${petMap})`);
-  vp.render();
-}
-
-// ─── Update PET W/L on fusion viewport ────────────────────────────────────────
-export function setFusionPetProperties(vp, { petWL, colormapName }) {
-  try { vp.setProperties({ voiRange: voiFromWL(petWL) }, PET_VOLUME_ID); } catch {}
-  vp.render();
-}
-
-// ─── Update CT VOI on fusion viewport ─────────────────────────────────────────
-export function setFusionCtVOI(vp, ctWL) {
   try {
-    vp.setProperties({ voiRange: voiFromWL(ctWL) }, CT_VOLUME_ID);
-    vp.render();
-  } catch {}
+    vp.setProperties({ voiRange: voiFromWL(petWL), colormap: { name: petColormapName } });
+  } catch(e) {
+    vp.setProperties({ voiRange: voiFromWL(petWL) });
+  }
+  console.log('[volumeManager] PET-only viewport: single volume, single-arg setProperties');
+  vp.render();
+}
+
+// --- Update PET W/L on PET-only viewport ---
+export function setFusionPetProperties(vp, { petWL, petColormapName, petOpacity }) {
+  try {
+    vp.setProperties({ voiRange: voiFromWL(petWL), colormap: { name: petColormapName } });
+  } catch(e) {
+    try { vp.setProperties({ voiRange: voiFromWL(petWL) }); } catch(e2) {}
+  }
+  vp.render();
+}
+
+// --- CT VOI update: no-op (CT volume not loaded in PET-only viewports) ---
+export function setFusionCtVOI(vp, ctWL) {
+  // CT volume not present in bottom-row viewports. No-op intentional.
 }
 
 // ─── Blend slider ─────────────────────────────────────────────────────────────
-// Canvas2D alpha is controlled by petOpacityRef in ViewerBox.
-// This just triggers a render so IMAGE_RENDERED fires and canvasFusion redraws.
+// Canvas2D overlay reads petOpacity directly from React state via closure.
+// Just trigger a CS3D render so IMAGE_RENDERED fires and canvasFusion redraws.
 export function setPetOpacity(viewportId, petOpacity, petWL) {
   try {
     const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId);
     if (!vp) return;
     vp.render();
-  } catch {}
+  } catch (e) {}
 }
 
 // ─── MIP viewport ─────────────────────────────────────────────────────────────
 export async function applyMIPVolume(vp, { petWL, colormapName, orientation = 'coronal' }) {
   await vp.setVolumes([{ volumeId: PET_VOLUME_ID }]);
-
-  try { vp.setOrientation(OrientationAxis.CORONAL); } catch {}
-
   vp.resetCamera();
 
-  const cmName = colormapName || 'petct_gray';
+  // Capture parallelScale NOW — immediately after resetCamera() sets it correctly.
+  // vp.render() below triggers VTK's internal pipeline which calls resetCamera()
+  // again internally, overwriting parallelScale with a wrong small value.
+  // We re-apply the correct value after render() and store it on window.__mipScale
+  // so _stepMIP in CineBar can use it on every setCamera() call.
+  let correctScale = null;
+  try { correctScale = vp.getCamera()?.parallelScale || null; } catch(e) {}
+
   try {
-    vp.setProperties({ voiRange: voiFromWL(petWL), colormap: { name: cmName } });
-  } catch {
+    vp.setProperties({ voiRange: voiFromWL(petWL), colormap: { name: colormapName } });
+  } catch (e) {
     vp.setProperties({ voiRange: voiFromWL(petWL) });
   }
-
-  try {
-    vp.setBlendMode(BlendModes.MAXIMUM_INTENSITY_BLEND);
-    vp.setSlabThickness(1000);
-  } catch {}
-
+  // MAXIMUM_INTENSITY_BLEND disabled — crashes Intel UHD 620 (Session 10 M3).
   vp.render();
-  console.log(`[volumeManager] MIP applied — colormap: ${cmName}`);
+
+  // Re-apply correct parallelScale after render() reset it, then store globally.
+  if (correctScale) {
+    try {
+      vp.setCamera({ parallelScale: correctScale });
+      window.__mipScale = correctScale;
+    } catch(e) {}
+  }
 }
 
 // ─── Orientation markers ──────────────────────────────────────────────────────

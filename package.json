@@ -10,9 +10,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@cornerstonejs/core": "^2.1.16",
-    "@cornerstonejs/dicom-image-loader": "^2.1.16",
-    "@cornerstonejs/tools": "^2.1.16",
+    "@cornerstonejs/core": "2.1.16",
+    "@cornerstonejs/dicom-image-loader": "2.1.16",
+    "@cornerstonejs/tools": "2.1.16",
     "dcmjs": "^0.29.0",
     "dicom-parser": "^1.8.21",
     "dicomweb-client": "^0.11.2",

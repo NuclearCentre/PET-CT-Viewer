@@ -179,6 +179,9 @@ function fallbackMetadataProvider(type, imageId) {
 // Calling it before coreInit() throws in CS3D v2.1.16 and kills the module,
 // preventing LAYOUT_DEFS from being exported. It is registered once inside
 // the ViewportGrid useEffect, after CS3D is guaranteed to be initialised.
+// _providerRegistered guards against duplicate registrations when studyUID
+// changes (the useEffect re-runs but must not call addProvider again).
+let _providerRegistered = false;
 
 // ─── Image ID builder ─────────────────────────────────────────────────────────
 async function _buildImageIds(studyUID, seriesUID) {
@@ -227,15 +230,24 @@ function _parseName(nameObj) {
 // ─── MIP zoom parity ──────────────────────────────────────────────────────────
 // Rule 29: MIP zoom handled here only — never in ViewerBox.
 function _syncMIPZoom(engine) {
-  try {
-    const ctVP  = engine.getViewport('ct-coronal');
-    const mipVP = engine.getViewport('mip');
-    if (!ctVP || !mipVP) return;
-    const cam = ctVP.getCamera();
-    if (!cam?.parallelScale) return;
-    mipVP.setCamera({ parallelScale: cam.parallelScale * 2 });
-    mipVP.render();
-  } catch {}
+  // applyMIPVolume is async and may not have completed when volumesReady fires.
+  // Poll every 500ms (max 20 attempts = 10s) until MIP camera has a valid
+  // parallelScale (> 100 confirms it is a real WB volume camera, not default).
+  // Stores to window.__mipScale so CineBar._stepMIP can use it in setCamera.
+  let attempts = 0;
+  const poll = setInterval(() => {
+    attempts++;
+    try {
+      const mipVP = engine.getViewport('mip');
+      const cam   = mipVP?.getCamera();
+      if (cam?.parallelScale > 100) {
+        window.__mipScale = cam.parallelScale;
+        console.log('[MIPZoom] parallelScale locked:', window.__mipScale);
+        clearInterval(poll);
+      }
+    } catch(e) {}
+    if (attempts >= 20) clearInterval(poll);
+  }, 500);
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -271,7 +283,11 @@ export default function ViewportGrid({
 
     // Register fallback metadata provider now — CS3D is guaranteed initialised
     // by the time any component mounts (main.jsx awaits initCornerstone first).
-    metaData.addProvider(fallbackMetadataProvider, 100);
+    // Guard prevents duplicate registration if useEffect re-runs (studyUID change).
+    if (!_providerRegistered) {
+      metaData.addProvider(fallbackMetadataProvider, 100);
+      _providerRegistered = true;
+    }
 
     (async () => {
       setLoading(true);
@@ -283,27 +299,39 @@ export default function ViewportGrid({
         if (!res.ok) throw new Error(`Series load failed: ${res.status}`);
         const sList = await res.json();
 
-        // Pass 1: prefer Whole Body series, skip NAC/non-corrected
-        let ct = null, pet = null;
-        for (const s of sList) {
-          const mod  = s['00080060']?.Value?.[0] || '';
-          const desc = (s['0008103E']?.Value?.[0] || '').toLowerCase();
-          if (desc.includes('nac') || desc.includes('non-corrected')) continue;
-          const isWB = ['wb', 'wholebody', 'whole body'].some(k => desc.includes(k));
-          if (mod === 'CT' && isWB && !ct)              ct  = s['0020000E']?.Value?.[0];
-          if (['PT', 'PET'].includes(mod) && isWB && !pet) pet = s['0020000E']?.Value?.[0];
+        // Series selection: pick the CT and PET/PT series with the most instances,
+        // skipping NAC, non-corrected, scouts, and topograms.
+        // WB series always has more slices than H&N or other sub-region series,
+        // so sorting by instance count guarantees WB is selected.
+        function _bestSeries(list, targetMod) {
+          const mods = targetMod === 'PET' ? ['PT', 'PET'] : ['CT'];
+          return list
+            .filter(s => {
+              const mod  = s['00080060']?.Value?.[0] || '';
+              const desc = (s['0008103E']?.Value?.[0] || '').toLowerCase();
+              if (!mods.includes(mod)) return false;
+              if (desc.includes('nac') || desc.includes('non-corrected') ||
+                  desc.includes('non corrected') || desc.includes('scout') ||
+                  desc.includes('topogram') || desc.includes('surview') ||
+                  desc.includes('localizer')) return false;
+              return true;
+            })
+            .sort((a, b) => {
+              const ai = parseInt(a['00201209']?.Value?.[0] || '0', 10);
+              const bi = parseInt(b['00201209']?.Value?.[0] || '0', 10);
+              return ai - bi; // ascending — fewest slices first = H&N wins (faster dev loading)
+            })[0] || null;
         }
 
-        // Pass 2: fallback — any CT/PET that isn't NAC
-        if (!ct || !pet) {
-          for (const s of sList) {
-            const mod  = s['00080060']?.Value?.[0] || '';
-            const desc = (s['0008103E']?.Value?.[0] || '').toLowerCase();
-            if (desc.includes('nac') || desc.includes('non-corrected')) continue;
-            if (mod === 'CT'                       && !ct)  ct  = s['0020000E']?.Value?.[0];
-            if (['PT', 'PET'].includes(mod)        && !pet) pet = s['0020000E']?.Value?.[0];
-          }
-        }
+        const ctSeries  = _bestSeries(sList, 'CT');
+        const petSeries = _bestSeries(sList, 'PET');
+        const ct  = ctSeries?.['0020000E']?.Value?.[0];
+        const pet = petSeries?.['0020000E']?.Value?.[0];
+
+        console.log('[ViewportGrid] CT series:', ctSeries?.['0008103E']?.Value?.[0],
+          '— instances:', ctSeries?.['00201209']?.Value?.[0]);
+        console.log('[ViewportGrid] PET series:', petSeries?.['0008103E']?.Value?.[0],
+          '— instances:', petSeries?.['00201209']?.Value?.[0]);
 
         if (!ct || !pet) throw new Error('No matching CT + PET series pair found in study.');
 
@@ -333,7 +361,7 @@ export default function ViewportGrid({
 
         // MIP zoom parity — 500ms after volumes ready (Rule 29)
         const engine = getRenderingEngine(RENDERING_ENGINE_ID);
-        if (engine) setTimeout(() => _syncMIPZoom(engine), 500);
+        if (engine) _syncMIPZoom(engine);  // self-polls until MIP camera ready
 
         // Patient metadata callback
         if (onMetaLoaded) {
@@ -421,6 +449,7 @@ export default function ViewportGrid({
               label={vpDef.label}
               accentColor={vpDef.accentColor}
               orientation={vpDef.orientation}
+              renderMode={vpDef.modality === 'MIP' ? 'volume' : 'stack'}
               imageIds={imageIdsFor(vpDef.modality)}
               volumesReady={volumesReady}
               wl={vpDef.modality === 'CT' ? ctWL : petWL}
@@ -431,6 +460,11 @@ export default function ViewportGrid({
               onOpacity={onOpacity}
               fusionMode={fusionMode}
               fusionOffset={fusionOffset}
+              toolGroupId={
+                vpDef.modality === 'CT'  ? 'tg-ct'  :
+                vpDef.modality === 'PET' ? 'tg-pet' :
+                vpDef.modality === 'MIP' ? 'tg-mpr' : undefined
+              }
             />
             <BoxPicker slotIdx={slotIdx} onBoxAssign={onBoxAssign} />
           </div>

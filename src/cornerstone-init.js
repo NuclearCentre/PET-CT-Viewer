@@ -121,7 +121,7 @@ export async function initCornerstone() {
         lineWidth:               '1.5',
         lineDash:                '',
         shadow:                  true,
-        textBoxVisibility:       true,
+        textBoxVisibility:       false,
         textBoxFontFamily:       'monospace',
         textBoxFontSize:         '12px',
         textBoxColor:            'rgb(255, 222, 0)',
