@@ -153,6 +153,13 @@ export default function ViewerBox({
   const glCanvasRef    = useRef(null);   // Canvas2D overlay (PET viewports)
   const glLUTRef       = useRef(null);   // current LUT array
   const glFramePending = useRef(false);  // rAF dedup
+  // MIP orbit values — locked once in setup() BEFORE vp.render() so VTK can't
+  // reset them. Declared in ViewerBox scope so setup() can write them AND
+  // CineBar._stepMIP can read them. (Previously declared only inside CineBar,
+  // which meant setup()'s writes were into a non-existent scope and silently
+  // threw a ReferenceError in the try/catch — refs were never populated.)
+  const mipFPRef   = useRef(null);  // locked focalPoint  [x,y,z]
+  const mipDistRef = useRef(null);  // locked orbital radius (mm)
   const [paletteId, setPaletteId]     = useState(DEFAULT_COLORMAP[modality] || 'gray');
   const [showPalMenu, setShowPalMenu] = useState(false);
   const [showPresets, setShowPresets] = useState(false);
@@ -1329,6 +1336,7 @@ export default function ViewerBox({
       <CineBar
         viewportId={viewportId} modality={modality} isMIP={modality === 'MIP'}
         mipPlaying={mipPlaying} onMipPlayingChange={setMipPlaying}
+        mipFPRef={mipFPRef} mipDistRef={mipDistRef}
       />
 
       {/* (Removed) auto-appearing "N selected / Delete" toolbar — it popped up
@@ -1510,7 +1518,7 @@ function _applyProps(vp, wl, paletteId) {
 //   We use setInterval at the chosen fps and call vp.scroll(1) which works
 //   for both STACK (stackScroll moves slice index) and ORTHOGRAPHIC volume
 //   (stackScroll advances the slab position on the current axis).
-function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }) {
+function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange, mipFPRef, mipDistRef }) {
   // MIP: playing state is lifted to ViewerBox so orientation bar can stop it.
   // Non-MIP: local state.
   const [localPlaying, setLocalPlaying] = useState(false)
@@ -1524,28 +1532,29 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
   // Track playing in a ref so the rAF closure always sees the latest value
   const playingRef = useRef(false)
 
-  // ── Step: advance by one unit (slice or MIP angle step) ──────────────────
-  // Locked MIP orbit values — captured once on first _stepMIP call.
-  // VTK resets cam.position and cam.parallelScale on every vp.render() call.
-  // Reading them back from the live camera after render gives wrong values.
-  // Solution: read ONCE before any render, lock in refs, use forever.
-  const mipFPRef   = useRef(null)  // locked focalPoint
-  const mipDistRef = useRef(null)  // locked orbital radius
+  // mipFPRef and mipDistRef are passed as props from ViewerBox (declared there
+  // so setup() can lock them before vp.render() and _stepMIP can read them here).
 
   function _stepMIP(angleDelta) {
+    // Advance the angle and update the camera — NO vp.render() here.
+    // render() is called by a separate 50ms interval (Rule 33: >50ms per frame
+    // on Intel UHD 620). Calling render() here AND in the render interval causes
+    // VTK to reset cam.position between our setCamera and the next frame paint,
+    // producing the visible flicker. Decoupling eliminates it:
+    //   angle timer  → setCamera only (fast, no GPU)
+    //   render timer → vp.render() only (slow GPU, ~20fps max)
     try {
       const engine = getRenderingEngine(RENDERING_ENGINE_ID)
       const vp = engine?.getViewport(viewportId)
       if (!vp) return
 
-      // mipFPRef and mipDistRef are locked in the auto-start poll (before rAF begins).
-      // Do NOT read cam.focalPoint or cam.position here — VTK resets them on every
-      // vp.render() call (Rule 32), so live camera values are unreliable mid-rotation.
+      // Do NOT read cam.focalPoint or cam.position — VTK resets them on every
+      // vp.render() call (Rule 32). Use the locked refs only.
       if (!mipFPRef.current || !mipDistRef.current) return
 
       const fp    = mipFPRef.current
       const dist  = mipDistRef.current
-      const scale = window.__mipScale || 1517  // parallelScale is zoom, NOT orbit radius
+      const scale = window.__mipScale || 1517
 
       angleRef.current = (angleRef.current + angleDelta + 360) % 360
       const rad = (angleRef.current * Math.PI) / 180
@@ -1560,7 +1569,7 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
         viewUp:        [0, 0, 1],
         parallelScale: scale,
       })
-      vp.render()
+      // No vp.render() — the renderTimer below handles all repaints.
     } catch(e) {}
   }
 
@@ -1583,23 +1592,24 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
     } catch(e) {}
   }
 
-  // ── rAF loop for MIP ─────────────────────────────────────────────────────
+  // ── rAF loop for MIP angle updates ───────────────────────────────────────
+  // Updates camera angle only — NO render call (see _stepMIP comment above).
   const fpsRef = useRef(fps)
   useEffect(() => { fpsRef.current = fps }, [fps])
 
   useEffect(() => {
     if (!isMIP || !playing) return
     playingRef.current = true
-    let last = -1  // -1 = uninitialised; set to ts on first frame
+    let last = -1
 
     function loop(ts) {
       if (!playingRef.current) return
-      if (last < 0) last = ts  // initialise on first frame — prevents huge first elapsed
+      if (last < 0) last = ts
       const rpm = Math.max(1, fpsRef.current)
-      const msPerDeg = 1000 / (rpm * 6)  // ms needed to advance 1°
+      const msPerDeg = 1000 / (rpm * 6)
       const elapsed  = ts - last
       if (elapsed >= msPerDeg) {
-        last += msPerDeg  // consume exactly one tick — prevents burst catch-up when render is slow
+        last += msPerDeg
         _stepMIP(1)
       }
       rAFRef.current = requestAnimationFrame(loop)
@@ -1609,6 +1619,25 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
     return () => {
       playingRef.current = false
       if (rAFRef.current) { cancelAnimationFrame(rAFRef.current); rAFRef.current = null }
+    }
+  }, [playing, isMIP, viewportId])
+
+  // ── Separate render timer for MIP — 50ms (20fps max, Rule 33) ────────────
+  // Intel UHD 620 takes >50ms per vp.render() on ORTHOGRAPHIC viewport.
+  // Decoupled from the angle rAF so a slow render frame doesn't stall rotation.
+  const renderTimerRef = useRef(null)
+  useEffect(() => {
+    if (!isMIP || !playing) return
+    renderTimerRef.current = setInterval(() => {
+      try {
+        const engine = getRenderingEngine(RENDERING_ENGINE_ID)
+        const vp = engine?.getViewport(viewportId)
+        if (vp) vp.render()
+      } catch(e) {}
+    }, 50)
+
+    return () => {
+      if (renderTimerRef.current) { clearInterval(renderTimerRef.current); renderTimerRef.current = null }
     }
   }, [playing, isMIP, viewportId])
 
@@ -1630,16 +1659,18 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
   useEffect(() => {
     return () => {
       playingRef.current = false
-      if (rAFRef.current)   { cancelAnimationFrame(rAFRef.current);   rAFRef.current   = null }
-      if (timerRef.current) { clearInterval(timerRef.current);         timerRef.current = null }
+      if (rAFRef.current)         { cancelAnimationFrame(rAFRef.current);   rAFRef.current         = null }
+      if (timerRef.current)       { clearInterval(timerRef.current);         timerRef.current       = null }
+      if (renderTimerRef.current) { clearInterval(renderTimerRef.current);   renderTimerRef.current = null }
     }
   }, [])
 
   function stop() {
     setPlaying(false)
     playingRef.current = false
-    if (rAFRef.current)   { cancelAnimationFrame(rAFRef.current);   rAFRef.current   = null }
-    if (timerRef.current) { clearInterval(timerRef.current);         timerRef.current = null }
+    if (rAFRef.current)         { cancelAnimationFrame(rAFRef.current);   rAFRef.current         = null }
+    if (timerRef.current)       { clearInterval(timerRef.current);         timerRef.current       = null }
+    if (renderTimerRef.current) { clearInterval(renderTimerRef.current);   renderTimerRef.current = null }
   }
 
   return (
