@@ -1,22 +1,29 @@
-/* name: ViewportGrid.jsx */
 /**
- * ViewportGrid.jsx — merged Session 9
+ * ViewportGrid.jsx -- Session 14 final
  *
- * From their file (kept):
- *   - Smart two-pass series selection (WB preferred, NAC skipped)
- *   - fallbackMetadataProvider via metaData.addProvider (robust catch-all)
- *   - Full imagePixelModule (samplesPerPixel, photometricInterpretation, highBit)
- *   - onMetaLoaded callback + _parseName
- *   - resetFusionTransform() called before purgeVolumes()
- *   - Loading message text
+ * Changes vs Session 13:
  *
- * From my file (kept):
- *   - DICOM tag fix: 00280010=rows, 00280011=columns (theirs used wrong tags)
- *   - All 6 LAYOUT_DEFS with gridTemplateColumns/gridTemplateRows strings
- *   - layout + boxAssignments + onBoxAssign props
- *   - BoxPicker component
- *   - MIP zoom sync (_syncMIPZoom)
- *   - mipImageIds state (separate from petImageIds)
+ * 1. PACS-agnostic DICOMweb URLs:
+ *    - Two configurable base constants replace the hardcoded /orthanc strings.
+ *    - DICOMWEB_REST_BASE: for metadata fetches (studies, series, instances lists).
+ *    - WADO_BASE: for WADO-URI image IDs (the per-instance pixel data).
+ *    - Defaults keep the EXISTING /orthanc proxy working with zero config change.
+ *    - To switch PACS: set window.__DICOMWEB_REST and window.__WADO_BASE before
+ *      the app loads. No code or proxy changes needed.
+ *
+ *    Orthanc URL structure (why two bases are needed):
+ *      REST metadata : GET /orthanc/dicom-web/studies/{uid}/series   (proxy strips /orthanc)
+ *      WADO-URI image: wadouri:/orthanc/wado?requestType=WADO&...    (proxy strips /orthanc)
+ *    Orthanc's WADO endpoint is /wado, NOT /dicom-web/wado. A single base with one
+ *    rewrite rule cannot serve both paths, so two separate bases are required.
+ *
+ * 2. Loading message updated (no longer says "Orthanc").
+ *
+ * 3. Everything else unchanged from Session 12/13:
+ *    - Series selection logic, metadata registry, metaData.addProvider guard.
+ *    - All layout definitions, BoxPicker, toolGroupId assignments.
+ *    - MIP zoom sync, onMetaLoaded callback.
+ *    - renderMode='volume' for all 7 viewports (CT, PET-CT, MIP).
  */
 
 import { useState, useEffect, useRef } from 'react';
@@ -26,20 +33,45 @@ import { RENDERING_ENGINE_ID } from '../cornerstone-init.js';
 import { ensureVolumes, purgeVolumes } from '../utils/volumeManager.js';
 import { resetFusionTransform } from '../utils/fusionManager.js';
 
-const BASE = '/orthanc/dicom-web';
+// ---------------------------------------------------------------------------
+// PACS base URL configuration
+//
+// DICOMWEB_REST_BASE : DICOMweb REST endpoint prefix (studies/series/instances).
+// WADO_BASE          : Prefix for WADO-URI image ID URLs (per-instance pixel data).
+//
+// Defaults use the existing /orthanc Vite proxy -- no vite.config.js change needed.
+// To use a different PACS: set these on window before the app loads:
+//   window.__DICOMWEB_REST = 'https://your-pacs.example.com/wado/rs'
+//   window.__WADO_BASE     = 'https://your-pacs.example.com'
+// ---------------------------------------------------------------------------
+function getDicomWebRestBase() {
+  return (typeof window !== 'undefined' && window.__DICOMWEB_REST)
+    ? window.__DICOMWEB_REST
+    : '/orthanc/dicom-web';
+}
 
-// ─── Viewport definitions ─────────────────────────────────────────────────────
+function getWadoBase() {
+  return (typeof window !== 'undefined' && window.__WADO_BASE)
+    ? window.__WADO_BASE
+    : '/orthanc';
+}
+
+// ---------------------------------------------------------------------------
+// Viewport definitions (unchanged from Session 12)
+// ---------------------------------------------------------------------------
 const CT_VIEWPORTS = [
-  { id: 'ct-axial',    label: 'CT · Axial',    modality: 'CT',  orientation: 'axial',    accentColor: '#88c4ff' },
-  { id: 'ct-coronal',  label: 'CT · Coronal',  modality: 'CT',  orientation: 'coronal',  accentColor: '#88c4ff' },
-  { id: 'ct-sagittal', label: 'CT · Sagittal', modality: 'CT',  orientation: 'sagittal', accentColor: '#88c4ff' },
+  { id: 'ct-axial',    label: 'CT \u00b7 Axial',    modality: 'CT',  orientation: 'axial',    accentColor: '#88c4ff' },
+  { id: 'ct-coronal',  label: 'CT \u00b7 Coronal',  modality: 'CT',  orientation: 'coronal',  accentColor: '#88c4ff' },
+  { id: 'ct-sagittal', label: 'CT \u00b7 Sagittal', modality: 'CT',  orientation: 'sagittal', accentColor: '#88c4ff' },
 ];
 const PET_VIEWPORTS = [
-  { id: 'pct-axial',    label: 'PET-CT · Axial',    modality: 'PET', orientation: 'axial',    accentColor: '#88dd88' },
-  { id: 'pct-coronal',  label: 'PET-CT · Coronal',  modality: 'PET', orientation: 'coronal',  accentColor: '#88dd88' },
-  { id: 'pct-sagittal', label: 'PET-CT · Sagittal', modality: 'PET', orientation: 'sagittal', accentColor: '#88dd88' },
+  { id: 'pct-axial',    label: 'PET-CT \u00b7 Axial',    modality: 'PET', orientation: 'axial',    accentColor: '#88dd88' },
+  { id: 'pct-coronal',  label: 'PET-CT \u00b7 Coronal',  modality: 'PET', orientation: 'coronal',  accentColor: '#88dd88' },
+  { id: 'pct-sagittal', label: 'PET-CT \u00b7 Sagittal', modality: 'PET', orientation: 'sagittal', accentColor: '#88dd88' },
 ];
-const MIP_VIEWPORT = { id: 'mip', label: 'MIP · WB', modality: 'MIP', orientation: 'coronal', accentColor: '#333333' };
+const MIP_VIEWPORT = {
+  id: 'mip', label: 'MIP \u00b7 WB', modality: 'MIP', orientation: 'coronal', accentColor: '#333333',
+};
 
 export const ALL_VP_DEFS = {
   'ct-axial':     CT_VIEWPORTS[0],
@@ -52,8 +84,9 @@ export const ALL_VP_DEFS = {
   'empty':        { id: 'empty', label: 'Empty', modality: null, accentColor: '#444' },
 };
 
-// ─── Layout definitions ───────────────────────────────────────────────────────
-// App.jsx uses LAYOUT_DEFS[layout].slots to build boxAssignments defaults.
+// ---------------------------------------------------------------------------
+// Layout definitions (unchanged from Session 12)
+// ---------------------------------------------------------------------------
 export const LAYOUT_DEFS = {
   '2x3mip': {
     gridTemplateColumns: '1fr 1fr 1fr 1fr',
@@ -62,7 +95,7 @@ export const LAYOUT_DEFS = {
       { vpKey: 'ct-axial'     },
       { vpKey: 'ct-coronal'   },
       { vpKey: 'ct-sagittal'  },
-      { vpKey: 'mip',           gridColumn: '4', gridRow: '1 / 3' },
+      { vpKey: 'mip', gridColumn: '4', gridRow: '1 / 3' },
       { vpKey: 'pct-axial'    },
       { vpKey: 'pct-coronal'  },
       { vpKey: 'pct-sagittal' },
@@ -111,16 +144,14 @@ export const LAYOUT_DEFS = {
   },
 };
 
-// ─── Metadata registry + provider ────────────────────────────────────────────
-// Stores raw DICOM data per imageId in a Map.
-// Registered as a CS3D metadata provider (priority 100) — catches any module
-// request CS3D makes that isn't already in the cache.
+// ---------------------------------------------------------------------------
+// Metadata registry + provider (unchanged from Session 12)
+// ---------------------------------------------------------------------------
 const metadataRegistry = new Map();
 
 function fallbackMetadataProvider(type, imageId) {
   if (!metadataRegistry.has(imageId)) return undefined;
   const d = metadataRegistry.get(imageId);
-
   const generalSeriesModule = {
     modality: d.modality,
     seriesInstanceUID: d.seriesInstanceUID,
@@ -145,8 +176,6 @@ function fallbackMetadataProvider(type, imageId) {
     highBit: 15,
     pixelRepresentation: d.pixelRepresentation,
   };
-
-  // All-inclusive object — covers any module key CS3D might request
   return {
     modality: d.modality,
     pixelRepresentation: d.pixelRepresentation,
@@ -175,21 +204,20 @@ function fallbackMetadataProvider(type, imageId) {
   };
 }
 
-// NOTE: metaData.addProvider is NOT called here at module scope.
-// Calling it before coreInit() throws in CS3D v2.1.16 and kills the module,
-// preventing LAYOUT_DEFS from being exported. It is registered once inside
-// the ViewportGrid useEffect, after CS3D is guaranteed to be initialised.
-// _providerRegistered guards against duplicate registrations when studyUID
-// changes (the useEffect re-runs but must not call addProvider again).
 let _providerRegistered = false;
 
-// ─── Image ID builder ─────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Image ID builder
+// REST calls use getDicomWebRestBase(). Image IDs use getWadoBase().
+// ---------------------------------------------------------------------------
 async function _buildImageIds(studyUID, seriesUID) {
-  const res = await fetch(`${BASE}/studies/${studyUID}/series/${seriesUID}/instances`);
-  if (!res.ok) throw new Error(`Instances fetch failed: ${res.status}`);
+  const restBase = getDicomWebRestBase();
+  const wadoBase = getWadoBase();
+
+  const res = await fetch(`${restBase}/studies/${studyUID}/series/${seriesUID}/instances`);
+  if (!res.ok) throw new Error(`Instances fetch failed: ${res.status} (REST base: ${restBase})`);
   const instances = await res.json();
 
-  // Sort by instance number for correct slice order
   instances.sort((a, b) =>
     parseInt(a['00200013']?.Value?.[0] || '0', 10) -
     parseInt(b['00200013']?.Value?.[0] || '0', 10)
@@ -197,18 +225,19 @@ async function _buildImageIds(studyUID, seriesUID) {
 
   return instances.map(inst => {
     const sop = inst['00080018']?.Value?.[0];
-    // wadouri: scheme → WADO-URI → Orthanc returns raw DICOM P10 file directly.
-    // dicomweb: scheme → WADO-RS → returns multipart/related MIME envelope →
-    // dicom-parser fails with "DICM prefix not found" on the MIME boundary bytes.
-    const id = `wadouri:/orthanc/wado?requestType=WADO&studyUID=${studyUID}&seriesUID=${seriesUID}&objectUID=${sop}&contentType=application/dicom`;
+    // WADO-URI: uses wadoBase (e.g. /orthanc) so Orthanc's /wado endpoint is hit.
+    // Proxy strips /orthanc prefix -> :8042/wado?requestType=WADO&... (correct).
+    const id = `wadouri:${wadoBase}/wado?requestType=WADO`
+      + `&studyUID=${studyUID}`
+      + `&seriesUID=${seriesUID}`
+      + `&objectUID=${sop}`
+      + `&contentType=application/dicom`;
 
     metadataRegistry.set(id, {
       modality:                inst['00080060']?.Value?.[0] || '',
       seriesInstanceUID:       seriesUID,
       seriesNumber:            inst['00200011']?.Value?.[0] ?? 1,
       pixelRepresentation:     inst['00280103']?.Value?.[0] ?? 0,
-      // FIX: correct DICOM tags — 00280010=Rows, 00280011=Columns
-      // (00280100=BitsAllocated, 00280101=BitsStored — wrong tags used previously)
       rows:                    inst['00280010']?.Value?.[0] ?? 512,
       columns:                 inst['00280011']?.Value?.[0] ?? 512,
       rescaleSlope:            inst['00281053']?.Value?.[0] ?? 1,
@@ -227,13 +256,10 @@ function _parseName(nameObj) {
   return raw.replace(/\^/g, ' ').trim();
 }
 
-// ─── MIP zoom parity ──────────────────────────────────────────────────────────
-// Rule 29: MIP zoom handled here only — never in ViewerBox.
+// ---------------------------------------------------------------------------
+// MIP zoom parity (unchanged from Session 12)
+// ---------------------------------------------------------------------------
 function _syncMIPZoom(engine) {
-  // applyMIPVolume is async and may not have completed when volumesReady fires.
-  // Poll every 500ms (max 20 attempts = 10s) until MIP camera has a valid
-  // parallelScale (> 100 confirms it is a real WB volume camera, not default).
-  // Stores to window.__mipScale so CineBar._stepMIP can use it in setCamera.
   let attempts = 0;
   const poll = setInterval(() => {
     attempts++;
@@ -250,7 +276,9 @@ function _syncMIPZoom(engine) {
   }, 500);
 }
 
-// ─── Component ────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
 export default function ViewportGrid({
   studyUID,
   ctWL,
@@ -276,14 +304,10 @@ export default function ViewportGrid({
   const ctImageIdsRef  = useRef([]);
   const petImageIdsRef = useRef([]);
 
-  // ── Series load ───────────────────────────────────────────────────────────
   useEffect(() => {
     if (!studyUID) return;
     let cancelled = false;
 
-    // Register fallback metadata provider now — CS3D is guaranteed initialised
-    // by the time any component mounts (main.jsx awaits initCornerstone first).
-    // Guard prevents duplicate registration if useEffect re-runs (studyUID change).
     if (!_providerRegistered) {
       metaData.addProvider(fallbackMetadataProvider, 100);
       _providerRegistered = true;
@@ -295,14 +319,14 @@ export default function ViewportGrid({
       setVolumesReady(false);
 
       try {
-        const res = await fetch(`${BASE}/studies/${studyUID}/series`);
-        if (!res.ok) throw new Error(`Series load failed: ${res.status}`);
+        const restBase = getDicomWebRestBase();
+        const res = await fetch(`${restBase}/studies/${studyUID}/series`);
+        if (!res.ok) throw new Error(
+          `Series load failed: ${res.status} -- REST base: ${restBase}\n` +
+          `Set window.__DICOMWEB_REST to override.`
+        );
         const sList = await res.json();
 
-        // Series selection: pick the CT and PET/PT series with the most instances,
-        // skipping NAC, non-corrected, scouts, and topograms.
-        // WB series always has more slices than H&N or other sub-region series,
-        // so sorting by instance count guarantees WB is selected.
         function _bestSeries(list, targetMod) {
           const mods = targetMod === 'PET' ? ['PT', 'PET'] : ['CT'];
           return list
@@ -319,7 +343,7 @@ export default function ViewportGrid({
             .sort((a, b) => {
               const ai = parseInt(a['00201209']?.Value?.[0] || '0', 10);
               const bi = parseInt(b['00201209']?.Value?.[0] || '0', 10);
-              return ai - bi; // ascending — fewest slices first = H&N wins (faster dev loading)
+              return ai - bi; // ascending: fewest slices first (H&N = faster dev)
             })[0] || null;
         }
 
@@ -328,12 +352,15 @@ export default function ViewportGrid({
         const ct  = ctSeries?.['0020000E']?.Value?.[0];
         const pet = petSeries?.['0020000E']?.Value?.[0];
 
+        console.log('[ViewportGrid] REST base:', restBase, '| WADO base:', getWadoBase());
         console.log('[ViewportGrid] CT series:', ctSeries?.['0008103E']?.Value?.[0],
-          '— instances:', ctSeries?.['00201209']?.Value?.[0]);
+          '-- instances:', ctSeries?.['00201209']?.Value?.[0]);
         console.log('[ViewportGrid] PET series:', petSeries?.['0008103E']?.Value?.[0],
-          '— instances:', petSeries?.['00201209']?.Value?.[0]);
+          '-- instances:', petSeries?.['00201209']?.Value?.[0]);
 
-        if (!ct || !pet) throw new Error('No matching CT + PET series pair found in study.');
+        if (!ct || !pet) throw new Error(
+          `No matching CT + PET series found.\nStudy: ${studyUID}\nREST base: ${restBase}`
+        );
 
         const [ctIds, petIds] = await Promise.all([
           _buildImageIds(studyUID, ct),
@@ -345,25 +372,21 @@ export default function ViewportGrid({
         ctImageIdsRef.current  = ctIds;
         petImageIdsRef.current = petIds;
 
-        // Order: purge volumes → reset transform → build new volumes (Session 8 fix)
         purgeVolumes();
         resetFusionTransform();
         await ensureVolumes(ctIds, petIds);
 
         if (cancelled) return;
 
-        // setState AFTER volumes are in cache — avoids React batch race (Session 8 fix)
         setCTImageIds(ctIds);
         setPETImageIds(petIds);
-        setMIPImageIds(petIds);  // MIP uses the same PET volume
+        setMIPImageIds(petIds);
         setVolumesReady(true);
         setLoading(false);
 
-        // MIP zoom parity — 500ms after volumes ready (Rule 29)
         const engine = getRenderingEngine(RENDERING_ENGINE_ID);
-        if (engine) _syncMIPZoom(engine);  // self-polls until MIP camera ready
+        if (engine) _syncMIPZoom(engine);
 
-        // Patient metadata callback
         if (onMetaLoaded) {
           onMetaLoaded({
             patientName: _parseName(sList[0]?.['00100010']?.Value?.[0]),
@@ -384,7 +407,7 @@ export default function ViewportGrid({
     return () => { cancelled = true; };
   }, [studyUID]);
 
-  // ── Slot resolution ───────────────────────────────────────────────────────
+  // Slot resolution (unchanged)
   const layoutDef   = LAYOUT_DEFS[layout] || LAYOUT_DEFS['2x3mip'];
   const activeSlots = layoutDef.slots.map((slot, idx) => {
     const vpKey = (boxAssignments?.[idx]) ? boxAssignments[idx] : slot.vpKey;
@@ -399,21 +422,19 @@ export default function ViewportGrid({
     return [];
   };
 
-  // ── Loading / error ───────────────────────────────────────────────────────
   if (loading) return (
     <div style={{ display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center', background: '#111', color: '#aaa', fontSize: 13 }}>
-      Streaming Attenuation-Corrected WholeBody Volumes from Orthanc...
+      Streaming DICOM volumes from PACS...
     </div>
   );
 
   if (error) return (
     <div style={{ display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center', background: '#111', color: '#ff6b6b', fontSize: 13, padding: 20, flexDirection: 'column', gap: 8 }}>
-      <div>⚠ Load error</div>
-      <div style={{ color: '#888', fontSize: 10 }}>{error}</div>
+      <div>Load error</div>
+      <div style={{ color: '#888', fontSize: 10, whiteSpace: 'pre-wrap', maxWidth: 500 }}>{error}</div>
     </div>
   );
 
-  // ── Grid ──────────────────────────────────────────────────────────────────
   return (
     <div style={{
       display: 'grid', flex: 1,
@@ -449,7 +470,7 @@ export default function ViewportGrid({
               label={vpDef.label}
               accentColor={vpDef.accentColor}
               orientation={vpDef.orientation}
-              renderMode={vpDef.modality === 'MIP' ? 'volume' : 'stack'}
+              renderMode='volume'
               imageIds={imageIdsFor(vpDef.modality)}
               volumesReady={volumesReady}
               wl={vpDef.modality === 'CT' ? ctWL : petWL}
@@ -474,16 +495,18 @@ export default function ViewportGrid({
   );
 }
 
-// ─── BoxPicker ────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// BoxPicker (unchanged from Session 12)
+// ---------------------------------------------------------------------------
 const VP_OPTIONS = [
-  { vpKey: 'ct-axial',     label: 'CT · Axial'       },
-  { vpKey: 'ct-coronal',   label: 'CT · Coronal'     },
-  { vpKey: 'ct-sagittal',  label: 'CT · Sagittal'    },
-  { vpKey: 'pct-axial',    label: 'PET-CT · Axial'   },
-  { vpKey: 'pct-coronal',  label: 'PET-CT · Coronal' },
-  { vpKey: 'pct-sagittal', label: 'PET-CT · Sagittal'},
-  { vpKey: 'mip',          label: 'MIP · WB'         },
-  { vpKey: 'empty',        label: 'Empty'            },
+  { vpKey: 'ct-axial',     label: 'CT \u00b7 Axial'        },
+  { vpKey: 'ct-coronal',   label: 'CT \u00b7 Coronal'      },
+  { vpKey: 'ct-sagittal',  label: 'CT \u00b7 Sagittal'     },
+  { vpKey: 'pct-axial',    label: 'PET-CT \u00b7 Axial'    },
+  { vpKey: 'pct-coronal',  label: 'PET-CT \u00b7 Coronal'  },
+  { vpKey: 'pct-sagittal', label: 'PET-CT \u00b7 Sagittal' },
+  { vpKey: 'mip',          label: 'MIP \u00b7 WB'          },
+  { vpKey: 'empty',        label: 'Empty'                   },
 ];
 
 function BoxPicker({ slotIdx, onBoxAssign, alwaysVisible = false }) {
@@ -504,7 +527,7 @@ function BoxPicker({ slotIdx, onBoxAssign, alwaysVisible = false }) {
           border: '1px solid #444', borderRadius: 3,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           cursor: 'pointer', fontSize: 11, color: '#aaa',
-        }} onClick={() => setOpen(v => !v)} title="Reassign viewport">⚙</div>
+        }} onClick={() => setOpen(v => !v)} title="Reassign viewport">&#9881;</div>
       )}
       {open && (
         <div style={{

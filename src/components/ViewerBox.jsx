@@ -70,6 +70,8 @@ function triggerAnnotationRenderForViewportIds(viewportIds) {
 const { ViewportType, Events, OrientationAxis } = CoreEnums;
 const { MouseBindings, KeyboardBindings } = ToolEnums;
 
+// Session 14: MIP uses inv_greyscale (inverse greyscale) -- user request.
+// PET fusion overlays use inv_hot_iron colourmap blended over CT greyscale base.
 const DEFAULT_COLORMAP = { CT: 'gray', PET: 'inv_hot_iron', MIP: 'inv_greyscale' }
 
 // MIP renders on a BLACK clear colour, then App.css inverts the whole canvas
@@ -151,7 +153,13 @@ export default function ViewerBox({
   const hasVP          = useRef(false);
   const cameraSyncedRef = useRef(false);  // one-shot flag for PET↔CT camera sync
   const glCanvasRef    = useRef(null);   // Canvas2D overlay (PET viewports)
-  const glLUTRef       = useRef(null);   // current LUT array
+  const glLUTRef         = useRef(null);   // current LUT array
+  // Refs for values read inside drawFrame closure -- avoids stale capture
+  // (drawFrame effect deps are [modality, isVolume, viewportId] so petOpacity,
+  //  ctWLFusion, petWLFusion would be stale if captured directly in the closure).
+  const petOpacityRef    = useRef(0.6);
+  const ctWLFusionRef    = useRef({ wc: 40,   ww: 400   });
+  const petWLFusionRef   = useRef({ wc: 5000, ww: 10000 });
   const glFramePending = useRef(false);  // rAF dedup
   // MIP orbit values — locked once in setup() BEFORE vp.render() so VTK can't
   // reset them. Declared in ViewerBox scope so setup() can write them AND
@@ -255,7 +263,9 @@ export default function ViewerBox({
           }
           el.addEventListener(Events.IMAGE_RENDERED, syncCameraOnce, { once: true })
         } else { // MIP
-          await applyMIPVolume(vp, { petWL: wl, colormapName: `petct_${paletteId}`, orientation });
+          // MIP colormap fixed to inv_greyscale (Session 14 request).
+          // paletteId is not used for MIP -- the MIP colormap is always inv_greyscale.
+          await applyMIPVolume(vp, { petWL: wl, colormapName: 'petct_inv_greyscale', orientation });
           // Lock camera values and start rotation HERE — this is the only reliable
           // moment where the viewport is enabled, the volume is loaded, and VTK
           // has not yet had a chance to reset the camera values via a render call.
@@ -362,6 +372,11 @@ export default function ViewerBox({
     // Build initial LUT from current palette
     glLUTRef.current = buildLUT(getColor, paletteId);
 
+    // Canvas2D fusion data sources (Session 14):
+    //   PET pixels : this viewport (pct-) holds PET volume -> getSlicePixelData returns PET 512x512
+    //   CT pixels  : matching ct- viewport holds CT volume -> getSlicePixelData returns CT 512x512
+    // renderFusion() draws CT grey base + PET colour overlay onto the Canvas2D.
+    // The Canvas2D (zIndex:5, alpha=255 every pixel) covers CS3D's WebGL render underneath.
     const ctVpId = viewportId.replace(/^pct-/, 'ct-');
 
     function drawFrame() {
@@ -375,9 +390,10 @@ export default function ViewerBox({
         const ctSlice  = getSlicePixelData(ctVp);
         if (!petSlice || !ctSlice) return;
 
-        const blend  = Math.max(0, Math.min(1, petOpacity));
-        const ctWL_  = ctWLFusion  || { wc: 40,  ww: 400  };
-        const petWL_ = petWLFusion || wl;
+        // Read from refs (not closure) to always get latest slider values.
+        const blend  = Math.max(0, Math.min(1, petOpacityRef.current));
+        const ctWL_  = ctWLFusionRef.current;
+        const petWL_ = petWLFusionRef.current;
 
         renderFusion(
           canvas,
@@ -422,6 +438,13 @@ export default function ViewerBox({
     glLUTRef.current = buildLUT(getColor, paletteId);
     try { getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)?.render(); } catch(e) {}
   }, [paletteId]);
+
+  // Keep drawFrame refs in sync with latest prop values.
+  // drawFrame reads these refs so it always uses current W/L and opacity
+  // even though the canvas effect only mounts once (deps=[modality,isVolume,viewportId]).
+  petOpacityRef.current  = petOpacity;
+  ctWLFusionRef.current  = ctWLFusion  || { wc: 40,   ww: 400   };
+  petWLFusionRef.current = petWLFusion || wl;
 
   // ── Sync flag changes → add/remove from synchronizers ────────────────────
   useEffect(() => {
