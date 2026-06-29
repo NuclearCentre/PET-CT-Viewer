@@ -1,16 +1,16 @@
-/**
- * ViewerBox.jsx -- Single Cornerstone3D viewport
+﻿/**
+ * ViewerBox.jsx — Single Cornerstone3D viewport
  *
  * Mouse bindings:
- *   Left drag    -> Pan
- *   Right drag   -> Zoom
- *   Middle drag  -> Window/Level
- *   Wheel        -> Scroll slices
+ *   Left drag    → Pan
+ *   Right drag   → Zoom
+ *   Middle drag  → Window/Level
+ *   Wheel        → Scroll slices
  *
  * Combo bindings (hold both buttons, then drag):
- *   Middle + Right -> draw Straight Line  (LengthTool)
- *   Middle + Left  -> draw Circle ROI     (CircleROITool)
- *   Right  + Left  -> move annotations    (passive tool grab)
+ *   Middle + Right → draw Straight Line  (LengthTool)
+ *   Middle + Left  → draw Circle ROI     (CircleROITool)
+ *   Right  + Left  → move annotations    (passive tool grab)
  *
  * Combo state machine:
  *   On first pointerdown, we record which button was pressed.
@@ -56,7 +56,6 @@ import {
   getOrientationMarkers,
 } from '../utils/volumeManager.js';
 import { applyFusionTransform, resetFusionTransform } from '../utils/fusionManager.js';
-import { renderPETOverlay, getPETPlaneWorldSpace, buildLUT } from '../utils/canvasFusion.js';
 
 // triggerAnnotationRenderForViewportIds polyfill for CS3D v2.1.16
 function triggerAnnotationRenderForViewportIds(viewportIds) {
@@ -70,16 +69,14 @@ function triggerAnnotationRenderForViewportIds(viewportIds) {
 const { ViewportType, Events, OrientationAxis } = CoreEnums;
 const { MouseBindings, KeyboardBindings } = ToolEnums;
 
-// Session 14: MIP uses inv_greyscale (inverse greyscale) -- user request.
-// PET fusion overlays use inv_hot_iron colourmap blended over CT greyscale base.
-const DEFAULT_COLORMAP = { CT: 'gray', PET: 'inv_hot_iron', MIP: 'inv_greyscale' }
+const DEFAULT_COLORMAP = { CT: 'gray', PET: 'hot_iron', MIP: 'gray' }
 
 // MIP renders on a BLACK clear colour, then App.css inverts the whole canvas
-// (filter: invert(1)) -> black background becomes white, bright uptake becomes
+// (filter: invert(1)) → black background becomes white, bright uptake becomes
 // dark. CT/PET stay black, un-inverted.
 const VP_BACKGROUND = { CT: [0,0,0], PET: [0,0,0], MIP: [0,0,0] };
 
-// Ribbon tool ids -> CS3D v2.1.16 toolNames (verified from package source).
+// Ribbon tool ids → CS3D v2.1.16 toolNames (verified from package source).
 // The Ribbon passes ids like 'line'; setToolActive needs 'Length'. Without this
 // mapping, toolbar tool buttons silently failed to activate any tool.
 const TOOL_ID_TO_CS = {
@@ -99,7 +96,7 @@ const TOOL_ID_TO_CS = {
   voi:         'RectangleROI',
   freehand:    'PlanarFreehandROI',
   // 'crosshair' handled separately (setCrosshairsActive)
-  // 'delete' / 'clear' are actions, not tools -- ignored here
+  // 'delete' / 'clear' are actions, not tools — ignored here
 };
 
 const CT_PRESETS = [
@@ -121,7 +118,7 @@ const PET_PRESETS = [
 export default function ViewerBox({
   viewportId,
   modality = 'CT',
-  label = 'CT . Axial',
+  label = 'CT · Axial',
   accentColor = '#88c4ff',
   imageIds = [],
   toolGroupId,
@@ -139,7 +136,7 @@ export default function ViewerBox({
   syncScroll = true,
   syncZoom   = false,
   syncPan    = false,
-  // -- Phase 3 -- volume / MPR / fusion --------------------------------------
+  // ── Phase 3 — volume / MPR / fusion ──────────────────────────────────────
   renderMode = 'stack',          // 'stack' (Phase 1/2) | 'volume' (Phase 3)
   orientation = 'axial',         // 'axial' | 'coronal' | 'sagittal'
   volumesReady = false,          // gate: volumes built before we render
@@ -151,17 +148,7 @@ export default function ViewerBox({
 }) {
   const divRef      = useRef(null);
   const hasVP          = useRef(false);
-  const cameraSyncedRef = useRef(false);  // one-shot flag for PET<->CT camera sync
-  const glCanvasRef    = useRef(null);   // Canvas2D overlay (PET viewports)
-  const glLUTRef         = useRef(null);   // current LUT array
-  // Refs for values read inside drawFrame closure -- avoids stale capture
-  // (drawFrame effect deps are [modality, isVolume, viewportId] so petOpacity,
-  //  ctWLFusion, petWLFusion would be stale if captured directly in the closure).
-  const petOpacityRef    = useRef(0.6);
-  const ctWLFusionRef    = useRef({ wc: 40,   ww: 400   });
-  const petWLFusionRef   = useRef({ wc: 5000, ww: 10000 });
-  const glFramePending = useRef(false);  // rAF dedup
-
+  const cameraSyncedRef = useRef(false);  // one-shot flag for PET↔CT camera sync
   const [paletteId, setPaletteId]     = useState(DEFAULT_COLORMAP[modality] || 'gray');
   const [showPalMenu, setShowPalMenu] = useState(false);
   const [showPresets, setShowPresets] = useState(false);
@@ -171,7 +158,9 @@ export default function ViewerBox({
 
   const isVolume = renderMode === 'volume';
 
-  // MIP auto-start: poll every 500ms until cam.focalPoint is non-zero.
+  // ── MIP auto-start: begin rotation once camera has a valid focalPoint ──────
+  // Polls every 500ms (max 15s) after mount. Sets mipPlaying=true once the MIP
+  // viewport camera is initialised by applyMIPVolume + zoom-parity sync.
   useEffect(() => {
     if (modality !== 'MIP') return
     let attempts = 0
@@ -181,6 +170,7 @@ export default function ViewerBox({
         const engine = getRenderingEngine(RENDERING_ENGINE_ID)
         const vp = engine?.getViewport(viewportId)
         const cam = vp?.getCamera()
+        // focalPoint is non-zero once applyMIPVolume has run
         if (cam?.focalPoint && cam.focalPoint.some(v => Math.abs(v) > 0.1)) {
           clearInterval(timer)
           setMipPlaying(true)
@@ -191,7 +181,7 @@ export default function ViewerBox({
     return () => clearInterval(timer)
   }, [modality, viewportId])
 
-  // -- Viewport setup --------------------------------------------------------
+  // ── Viewport setup ────────────────────────────────────────────────────────
   useEffect(() => {
     // Gate: stack mode needs imageIds; volume mode needs the shared volumes built.
     const ready = isVolume ? volumesReady : imageIds.length > 0;
@@ -221,26 +211,6 @@ export default function ViewerBox({
         if (svgLayer) svgLayer.style.overflow = 'hidden';
       } catch(e) {}
 
-      // MIP white background fix:
-      // CS3D creates a WebGL canvas inside el. Its CSS background defaults to
-      // transparent/black regardless of the VP_BACKGROUND [1,1,1] setting.
-      // VP_BACKGROUND controls the WebGL CLEAR colour (what CS3D clears to before
-      // each frame) but NOT the CSS background of the canvas element itself.
-      // When the WebGL canvas has transparent CSS background, the black divRef
-      // background shows through wherever CS3D hasn't painted.
-      // Fix: after every IMAGE_RENDERED, set the WebGL canvas CSS background to
-      // white for MIP. This is a CSS property -- CS3D never touches it.
-      if (modality === 'MIP') {
-        const _setMIPCanvasBg = () => {
-          try {
-            const webglCanvas = el.querySelector('canvas');
-            if (webglCanvas) webglCanvas.style.background = '#ffffff';
-            el.style.background = '#ffffff';
-          } catch(e) {}
-        };
-        el.addEventListener(Events.IMAGE_RENDERED, _setMIPCanvasBg);
-      }
-
       const vp = engine.getViewport(viewportId);
       if (!vp || cancelled) return;
 
@@ -250,7 +220,7 @@ export default function ViewerBox({
       }
 
       if (isVolume) {
-        // -- Phase 3 -- volume / MPR / fusion ---------------------------------
+        // ── Phase 3 — volume / MPR / fusion ─────────────────────────────────
         if (modality === 'CT') {
           await applyCTVolume(vp, { wl, colormapName: `petct_${paletteId}` });
         } else if (modality === 'PET') {
@@ -260,26 +230,65 @@ export default function ViewerBox({
             petColormapName: `petct_${paletteId}`,
             petOpacity,
           });
-
+          // ── CT/PET size parity ─────────────────────────────────────────────
+          // applyCTVolume and applyFusionVolumes each call resetCamera() which
+          // fits the volume to the viewport. CT (600 slices, large FOV) and PET
+          // (200 slices, smaller FOV) end up at different parallelScale values
+          // → images appear different sizes.
+          //
+          // Fix: after the PET viewport's FIRST IMAGE_RENDERED (guarantees
+          // applyCTVolume/applyFusionVolumes and their resetCamera() calls have
+          // both completed), read the matching CT viewport's parallelScale and
+          // apply it here. parallelScale only — position/focalPoint stay
+          // independent so each plane shows the correct anatomy centre.
+          //
+          // cameraSyncedRef prevents this from running on every scroll render.
+          // It resets to false in the useEffect cleanup so a re-mount re-syncs.
+          cameraSyncedRef.current = false
+          const syncCameraOnce = () => {
+            if (cameraSyncedRef.current || cancelled) return
+            cameraSyncedRef.current = true
+            try {
+              const engine = getRenderingEngine(RENDERING_ENGINE_ID)
+              // pct-axial → ct-axial, pct-coronal → ct-coronal, pct-sagittal → ct-sagittal
+              const ctId = viewportId.replace(/^pct-/, 'ct-')
+              const ctVp = engine?.getViewport(ctId)
+              if (!ctVp) return
+              const ctCam  = ctVp.getCamera()
+              if (!ctCam?.parallelScale) return
+              const ourCam = vp.getCamera()
+              vp.setCamera({ ...ourCam, parallelScale: ctCam.parallelScale })
+              vp.render()
+            } catch(e) {}
+          }
+          el.addEventListener(Events.IMAGE_RENDERED, syncCameraOnce, { once: true })
         } else { // MIP
-          // MIP colormap fixed to inv_greyscale (Session 14 request).
-          // paletteId is not used for MIP -- the MIP colormap is always inv_greyscale.
-          await applyMIPVolume(vp, { petWL: wl, colormapName: 'petct_greyscale', orientation });
-          // Lock camera values and start rotation HERE -- this is the only reliable
-          // moment where the viewport is enabled, the volume is loaded, and VTK
-          // has not yet had a chance to reset the camera values via a render call.
-          // All poll-based approaches failed because the viewport isn't available
-          // when __mipScale is first set, and focalPoint is [0,0,0] after any render.
-          // Rotation auto-started by poll useEffect (Session 8 approach).
+          await applyMIPVolume(vp, { petWL: wl, colormapName: `petct_${paletteId}`, orientation });
+
+          // ── MIP zoom parity ───────────────────────────────────────────────
+          // After resetCamera() the MIP shows the patient at the same zoom as
+          // a 1-row coronal, but the MIP box is 2 rows tall — so the patient
+          // only fills the top half with black below. Fix: double parallelScale
+          // so the patient fills the full 2-row height at the same pixel-per-mm
+          // density as the coronal viewports.
+          // Done on first IMAGE_RENDERED (after resetCamera has settled).
+          el.addEventListener(Events.IMAGE_RENDERED, function syncMIPZoomOnce() {
+            el.removeEventListener(Events.IMAGE_RENDERED, syncMIPZoomOnce)
+            try {
+              const cam = vp.getCamera()
+              if (!cam?.parallelScale) return
+              vp.setCamera({ ...cam, parallelScale: cam.parallelScale * 2 })
+              vp.render()
+            } catch(e) {}
+          })
         }
         if (cancelled) return;
         hasVP.current = true;
 
-        // Volume viewports don't emit STACK_NEW_IMAGE -- derive slice from the
+        // Volume viewports don't emit STACK_NEW_IMAGE — derive slice from the
         // camera on every render.
         const updateSlice = () => {
           try {
-            if (modality === 'MIP') return; // MIP is a projection not a slice stack
             const cur   = vp.getSliceIndex?.();
             const total = vp.getNumberOfSlices?.();
             if (typeof cur === 'number' && typeof total === 'number') {
@@ -294,7 +303,7 @@ export default function ViewerBox({
         });
         updateSlice();
       } else {
-        // -- Phase 1/2 -- stack -----------------------------------------------
+        // ── Phase 1/2 — stack ───────────────────────────────────────────────
         await vp.setStack(imageIds, 0);
         vp.resetCamera();
         _applyProps(vp, wl, paletteId);
@@ -344,68 +353,7 @@ export default function ViewerBox({
     };
   }, [viewportId, imageIds, toolGroupId, renderMode, orientation, volumesReady]);
 
-  // -- Canvas2D fusion overlay -----------------------------------------------
-  useEffect(() => {
-    if (modality !== 'PET' || !isVolume) return;
-    const canvas = glCanvasRef.current;
-    if (!canvas) return;
-
-    // Fusion canvas uses inv_hot_iron (white=high uptake, black=zero uptake).
-    glLUTRef.current = buildLUT(getColor, 'inv_hot_iron');
-
-    function drawFrame() {
-      glFramePending.current = false;
-      try {
-        // PET intensity slider -- CS3D renders PET natively in pct- viewport.
-        // divRef.style.opacity = blend fades only the PET image.
-        // Black ViewerBox background is behind divRef and never changes.
-        // blend=0 -> PET invisible. blend=1 -> PET full intensity.
-        const blend = Math.max(0, Math.min(1, petOpacityRef.current));
-        if (divRef.current) divRef.current.style.opacity = String(blend);
-        const ctx = canvas.getContext('2d');
-        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
-      } catch(e) {
-        console.warn('[canvasFusion] drawFrame:', e && e.message);
-      }
-    }
-    function onRendered() {
-      if (glFramePending.current) return;
-      glFramePending.current = true;
-      requestAnimationFrame(drawFrame);
-    }
-
-    const el = divRef.current;
-    if (el) el.addEventListener(Events.IMAGE_RENDERED, onRendered);
-    return () => {
-      if (el) el.removeEventListener(Events.IMAGE_RENDERED, onRendered);
-      // Reset divRef (CT) back to visible and clear canvas on unmount
-      try { if (divRef.current) divRef.current.style.opacity = '1'; } catch(e) {}
-      try { canvas.style.opacity = '0'; } catch(e) {}
-      try {
-        const ctx = canvas.getContext('2d');
-        ctx?.clearRect(0, 0, canvas.width, canvas.height);
-      } catch(e) {}
-    };
-  }, [modality, isVolume, viewportId]);
-
-  // When palette changes on the colourmap strip, the strip updates visually.
-  // The fusion canvas LUT stays hot_iron always (see comment above).
-  // We still trigger a re-render so the strip repaints.
-  useEffect(() => {
-    if (modality !== 'PET' || !isVolume) return;
-    // Fusion canvas uses inv_hot_iron (white=high uptake, black=zero uptake).
-    glLUTRef.current = buildLUT(getColor, 'inv_hot_iron');
-    try { getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)?.render(); } catch(e) {}
-  }, [paletteId]);
-
-  // Keep drawFrame refs in sync with latest prop values.
-  // drawFrame reads these refs so it always uses current W/L and opacity
-  // even though the canvas effect only mounts once (deps=[modality,isVolume,viewportId]).
-  petOpacityRef.current  = petOpacity;
-  ctWLFusionRef.current  = ctWLFusion  || { wc: 40,   ww: 400   };
-  petWLFusionRef.current = petWLFusion || wl;
-
-  // -- Sync flag changes -> add/remove from synchronizers --------------------
+  // ── Sync flag changes → add/remove from synchronizers ────────────────────
   useEffect(() => {
     if (!hasVP.current || !SYNC_VIEWPORT_IDS.includes(viewportId)) return;
     if (syncScroll) addViewportToSync(SYNC_SCROLL_ID, viewportId);
@@ -424,7 +372,7 @@ export default function ViewerBox({
     else removeViewportFromSync(SYNC_PAN_ID, viewportId);
   }, [syncPan, viewportId]);
 
-  // -- W/L update ------------------------------------------------------------
+  // ── W/L update ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!hasVP.current) return;
     try {
@@ -436,8 +384,9 @@ export default function ViewerBox({
           try { vp.setProperties({ voiRange: _voi(wl), colormap: { name: cmap } }); }
           catch(e) { vp.setProperties({ voiRange: _voi(wl) }); }
         } else if (modality === 'PET') {
-          // CT VOI update only -- Canvas2D handles colour.
-          try { setFusionCtVOI(vp, ctWLFusion || { wc:40, ww:400 }); } catch(e) {}
+          // CT: VOI only. Colormap and 0.99 opacity were set at init and stay stable.
+          setFusionCtVOI(vp, ctWLFusion || { wc: 40, ww: 400 });
+          // PET: VOI + colormap + opacity ramp.
           setFusionPetProperties(vp, { petWL: petWLFusion || wl, petColormapName: cmap, petOpacity });
         } else { // MIP
           try { vp.setProperties({ voiRange: _voi(wl), colormap: { name: cmap } }); }
@@ -451,7 +400,7 @@ export default function ViewerBox({
     } catch(e) {}
   }, [wl, paletteId, ctWLFusion, petWLFusion]);
 
-  // -- PET overlay opacity (fusion blend slider) -----------------------------
+  // ── PET overlay opacity (fusion blend slider) ─────────────────────────────
   useEffect(() => {
     if (!hasVP.current || !isVolume || modality !== 'PET') return;
     // Pass petWL so buildPetOpacityArray can build the correct value-mapped
@@ -470,7 +419,7 @@ export default function ViewerBox({
     applyFusionTransform(tx, ty, tz, rx, ry, rz)
   }, [fusionOffset, modality, isVolume])
 
-  // -- Toolbar tool override -------------------------------------------------
+  // ── Toolbar tool override ─────────────────────────────────────────────────
   useEffect(() => {
     if (!toolGroupId) return;
     const tg = ToolGroupManager.getToolGroup(toolGroupId);
@@ -481,7 +430,7 @@ export default function ViewerBox({
     if (isVolume) setCrosshairsActive(activeToolOverride === 'crosshair');
     if (activeToolOverride === 'crosshair') return; // handled by setCrosshairsActive
 
-    // Map ribbon ids -> CS3D toolNames; unknown/action ids restore Pan.
+    // Map ribbon ids → CS3D toolNames; unknown/action ids restore Pan.
     const csName = activeToolOverride ? TOOL_ID_TO_CS[activeToolOverride] : null;
 
     if (csName) {
@@ -533,7 +482,7 @@ export default function ViewerBox({
     } catch(e) {}
   }, [activeToolOverride, toolGroupId]);
 
-  // -- Right-click delete popup ----------------------------------------------
+  // ── Right-click delete popup ──────────────────────────────────────────────
   // CS3D captures right-button for Zoom. We detect a right-click that didn't
   // move (not a zoom drag) via pointerdown/pointerup distance check.
   const [deletePopup, setDeletePopup] = useState(null) // { x, y }
@@ -576,7 +525,7 @@ export default function ViewerBox({
     setTimeout(() => window.addEventListener('pointerdown', close, { once: true }), 50)
   }, [deletePopup])
 
-  // -- Viewport-scoped annotations -------------------------------------------
+  // ── Viewport-scoped annotations ───────────────────────────────────────────
   // ANNOTATION_ADDED fires on eventTarget with evt.detail.viewportId.
   // Tag each annotation with sourceViewportId immediately, before first render.
   // Then _applyViewportVisibility hides it on all other viewports.
@@ -611,7 +560,7 @@ export default function ViewerBox({
         // places text at the rightmost annotation point + 25px, which is
         // ADJACENT to the annotation with zero gap in the link line.
         // The ANNOTATION_RENDERED handler below clamps it into the safe zone
-        // if it overflows a viewport edge -- without introducing an artificial gap.
+        // if it overflows a viewport edge — without introducing an artificial gap.
       } catch(e) {}
     }
 
@@ -619,15 +568,15 @@ export default function ViewerBox({
       setDrawingComplete(true)
       // Force stats recalculation with retry.
       // Root cause: CS3D's _calculateCachedStats silently skips when
-      // getTargetImageData() returns null -- the volume slice containing this
+      // getTargetImageData() returns null — the volume slice containing this
       // ROI hasn't streamed yet. We poll until stats appear.
       //
       // Uses triggerAnnotationRenderForViewportIds (CS3D's own API) instead of
-      // vp.render() -- this specifically re-runs renderAnnotation on every tool,
+      // vp.render() — this specifically re-runs renderAnnotation on every tool,
       // which calls _calculateCachedStats for any annotation with invalidated=true.
       // Plain vp.render() can skip annotation re-rendering in some CS3D code paths.
       //
-      // 8 retries x 500ms = 4 seconds total coverage (handles slow networks /
+      // 8 retries × 500ms = 4 seconds total coverage (handles slow networks /
       // large PET volumes where the specific slice may take time to stream).
       //
       // Row-shared PET-CT ROIs: trigger all 3 pct- viewports so each plane
@@ -639,7 +588,7 @@ export default function ViewerBox({
 
         // Build the list of viewports to trigger.
         // If this is a row-shared pct annotation, include all pct- viewports
-        // so every plane gets its own stats (axial SUV != coronal SUV because
+        // so every plane gets its own stats (axial SUV ≠ coronal SUV because
         // each plane intersects the ROI at a different depth through the volume).
         const isRowShared = ann.metadata?.rowShared && ann.metadata?.viewportRow === 'pct'
         const triggerIds = isRowShared
@@ -653,7 +602,7 @@ export default function ViewerBox({
             const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)
             if (!vp) return
             ann.invalidated = true
-            // Use CS3D's targeted annotation render API -- guarantees renderAnnotation
+            // Use CS3D's targeted annotation render API — guarantees renderAnnotation
             // is called for every tool on this viewport, which re-runs cachedStats.
             try {
               triggerAnnotationRenderForViewportIds(triggerIds)
@@ -681,7 +630,7 @@ export default function ViewerBox({
     }
   }, [viewportId])
 
-  // -- Volume-loaded fallback for missing stats ------------------------------
+  // ── Volume-loaded fallback for missing stats ──────────────────────────────
   // IMAGE_VOLUME_LOADING_COMPLETE fires once when the full volume has finished
   // streaming. Any ROI drawn during streaming whose poll window (4s) expired
   // before its slice loaded will have null cachedStats. This handler finds all
@@ -836,7 +785,7 @@ export default function ViewerBox({
     } catch(e) {}
   }, [viewportId])
 
-  // -- ANNOTATION_RENDERED: clamp textbox + draw handle dots -----------------
+  // ── ANNOTATION_RENDERED: clamp textbox + draw handle dots ─────────────────
   // Fires after every SVG annotation repaint with current canvas coordinates.
   useEffect(() => {
     const RENDERED = 'CORNERSTONE_TOOLS_ANNOTATION_RENDERED'
@@ -853,10 +802,10 @@ export default function ViewerBox({
         const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)
         if (!vp) return
 
-        // -- Handle overlay ----------------------------------------------------
+        // ── Handle overlay ────────────────────────────────────────────────────
         // CS3D draws its own native <circle class="handle"> dots at the raw
         // points[] positions (2 for Circle, 4 for Ellipse, 2 for Rect).
-        // We want richer geometry. Hide CS3D's dots per annotation UID (scoped --
+        // We want richer geometry. Hide CS3D's dots per annotation UID (scoped —
         // LengthTool / Arrow etc. keep their own dots), then draw ours.
         const svgLayer = el.querySelector('div.viewport-element > svg.svg-layer')
         if (!svgLayer) return
@@ -903,7 +852,7 @@ export default function ViewerBox({
           }
 
           if (toolName === 'CircleROI') {
-            // Canvas-space rim dots -- correct for all MPR orientations.
+            // Canvas-space rim dots — correct for all MPR orientations.
             const c_cv   = vp.worldToCanvas(pts[0])
             const rim_cv = vp.worldToCanvas(pts[1])
             const r_px   = Math.hypot(rim_cv[0]-c_cv[0], rim_cv[1]-c_cv[1])
@@ -962,7 +911,7 @@ export default function ViewerBox({
 
   function _applyViewportVisibility() {
     // VOLUME / MPR mode: do NOT touch annotation visibility. CS3D's annotation
-    // visibility is GLOBAL, not per-viewport -- and in MPR all six viewports share
+    // visibility is GLOBAL, not per-viewport — and in MPR all six viewports share
     // the CT frame of reference, so hiding "other viewports'" annotations here
     // hides them EVERYWHERE, including the box they were just drawn in (they flash
     // then vanish). CS3D already scopes annotations by plane in MPR, so no manual
@@ -974,7 +923,7 @@ export default function ViewerBox({
       let changed = false
       all.forEach(ann => {
         const src = ann.metadata?.sourceViewportId
-        if (!src) return // untagged -- don't touch
+        if (!src) return // untagged — don't touch
 
         let shouldShow
         if (ann.metadata?.rowShared && ann.metadata?.viewportRow) {
@@ -997,10 +946,10 @@ export default function ViewerBox({
     } catch(e) {}
   }
 
-  // -- Annotation deletion ---------------------------------------------------
+  // ── Annotation deletion ───────────────────────────────────────────────────
   // Track selected annotation UIDs via CS3D ANNOTATION_SELECTION_CHANGE event.
   // Show a floating delete toolbar when any annotation is selected.
-  // NO right-click context menu -- right-click is reserved for Zoom.
+  // NO right-click context menu — right-click is reserved for Zoom.
   const [selectedUIDs,    setSelectedUIDs]    = useState([]);
   const [drawingComplete, setDrawingComplete] = useState(false);
 
@@ -1038,7 +987,7 @@ export default function ViewerBox({
     }
   }, [viewportId]);
 
-  // -- Delete key -- scoped to this viewport ---------------------------------
+  // ── Delete key — scoped to this viewport ─────────────────────────────────
   const pointerInsideRef = useRef(false)
 
   useEffect(() => {
@@ -1111,7 +1060,7 @@ export default function ViewerBox({
           const d = Math.hypot(cp[0] - cx, cp[1] - cy);
           if (d < bestDist) { bestDist = d; best = ann; }
         }
-        if (n) { // centroid (~= line midpoint / ROI centre)
+        if (n) { // centroid (≈ line midpoint / ROI centre)
           const d = Math.hypot(sx / n - cx, sy / n - cy);
           if (d < bestDist) { bestDist = d; best = ann; }
         }
@@ -1158,13 +1107,13 @@ export default function ViewerBox({
     } catch(e) {}
   }
 
-  // Render every viewport -- used after a delete so the annotation disappears
+  // Render every viewport — used after a delete so the annotation disappears
   // from all planes/boxes that were showing it (same-plane fusion view etc.).
   function _renderAll() {
     try { getRenderingEngine(RENDERING_ENGINE_ID)?.render(); } catch(e) {}
   }
 
-  // -- Palette helpers -------------------------------------------------------
+  // ── Palette helpers ───────────────────────────────────────────────────────
   const rawPalettes = (modality === 'PET' || modality === 'MIP') ? PET_PALETTES : CT_PALETTES;
   const palettes    = modality === 'MIP' ? rawPalettes.filter(p => p.group !== 'fmri') : rawPalettes;
   const presets  = modality === 'PET' ? PET_PRESETS  : CT_PRESETS;
@@ -1174,28 +1123,27 @@ export default function ViewerBox({
   const openPre  = () => { clearTimeout(closeTimers.current.pre); setShowPresets(true); };
   const closePre = () => { closeTimers.current.pre = setTimeout(() => setShowPresets(false), 180); };
 
-  // -- Render ----------------------------------------------------------------
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div
       onDoubleClick={onDoubleClick}
       className={modality === 'MIP' ? 'vp-mip' : undefined}
       style={{
-        position: 'absolute', inset: 0, overflow: 'visible',
+        position: 'absolute', inset: 0, overflow: 'hidden',
         background: modality === 'MIP' ? '#ffffff' : '#000000',
         border: `1.5px solid ${isExpanded ? accentColor : modality === 'MIP' ? '#cccccc' : '#252525'}`,
         borderRadius: 3,
         display: 'flex', flexDirection: 'column',
       }}
     >
-      {/* CS3D viewport element -- clipPath on BOTH the wrapper AND the element
+      {/* CS3D viewport element — clipPath on BOTH the wrapper AND the element
           itself. CS3D appends its SVG annotation layer as a child of divRef,
-          so clipping only the outer wrapper isn't enough -- we must clip divRef
+          so clipping only the outer wrapper isn't enough — we must clip divRef
           too. Both use inset(0) which clips at the element boundary. */}
       <div style={{
         flex: 1, minHeight: 0, position: 'relative',
         overflow: 'hidden',
         clipPath: 'inset(0)',
-        background: modality === 'MIP' ? '#ffffff' : '#000000',
       }}>
         <div
           ref={divRef}
@@ -1204,19 +1152,9 @@ export default function ViewerBox({
             position: 'absolute', inset: 0,
             overflow: 'hidden',
             clipPath: 'inset(0)',   // clips SVG annotation labels at this div's edge
-            background: modality === 'MIP' ? '#ffffff' : '#000000',
           }}
         />
       </div>
-
-      {/* Canvas2D fusion overlay -- drawn on IMAGE_RENDERED, transparent until then */}
-      {modality === 'PET' && isVolume && (
-        <canvas ref={glCanvasRef} style={{
-          position: 'absolute', inset: 0,
-          width: '100%', height: '100%',
-          pointerEvents: 'none', zIndex: 6,
-        }} />
-      )}
 
       {/* Fusion alignment overlay -- manual mode, PET-CT viewports only.
           Dashed blue crosshair giving visual feedback that the PET layer is being
@@ -1226,10 +1164,10 @@ export default function ViewerBox({
         <FusionOverlay fusionOffset={fusionOffset} />
       )}
 
-      {/* Orientation markers (R/L/A/P/S/I) -- volume MPR viewports only */}
+      {/* Orientation markers (R/L/A/P/S/I) — volume MPR viewports only */}
       {isVolume && modality !== 'MIP' && <OrientationMarkers orientation={orientation} />}
 
-      {/* Label -- top left */}
+      {/* Label — top left */}
       <div style={{
         position: 'absolute', top: 6, left: 8,
         fontSize: 10, fontFamily: 'monospace',
@@ -1240,17 +1178,17 @@ export default function ViewerBox({
         {label}
       </div>
 
-      {/* Patient info -- top right */}
+      {/* Patient info — top right */}
       <div style={{
         position: 'absolute', top: 6, right: 28,
         textAlign: 'right', pointerEvents: 'none', userSelect: 'none',
         textShadow: '0 1px 3px rgba(0,0,0,.9)',
       }}>
         <div style={{ fontSize: 9, fontFamily: 'monospace', color: '#ffffff', lineHeight: 1.4 }}>
-          ALKA JAGTAP . F . 52y
+          ALKA JAGTAP · F · 52y
         </div>
         <div style={{ fontSize: 8, fontFamily: 'monospace', color: '#dddddd', lineHeight: 1.4 }}>
-          PET-CT . 28 Jan 2026
+          PET-CT · 28 Jan 2026
         </div>
         {sliceInfo.total > 0 && (
           <div style={{ fontSize: 8, fontFamily: 'monospace', color: '#bbbbbb', lineHeight: 1.4 }}>
@@ -1259,7 +1197,7 @@ export default function ViewerBox({
         )}
       </div>
 
-      {/* Slice number -- left middle */}
+      {/* Slice number — left middle */}
       {sliceInfo.total > 0 && (
         <div style={{
           position: 'absolute', left: 8, top: '50%',
@@ -1275,7 +1213,7 @@ export default function ViewerBox({
         </div>
       )}
 
-      {/* W/L display -- bottom left, above cine bar */}
+      {/* W/L display — bottom left, above cine bar */}
       <div style={{
         position: 'absolute', bottom: modality === 'PET' ? 52 : 24, left: 28,
         fontSize: 9, fontFamily: 'monospace', color: '#ffffff',
@@ -1285,7 +1223,7 @@ export default function ViewerBox({
         W:{wl.ww} L:{wl.wc}
       </div>
 
-      {/* SUV bar -- PET only */}
+      {/* SUV bar — PET only */}
       {modality === 'PET' && (
         <SUVBar suvMin={suvMin} suvMax={suvMax} onSUV={onSUV} />
       )}
@@ -1294,10 +1232,10 @@ export default function ViewerBox({
       <PresetBar
         presets={presets} accentColor={accentColor}
         open={showPresets} onEnter={openPre} onLeave={closePre}
-        onSelect={p => { onWL?.({ wc: p.wc, ww: p.ww }); setShowPresets(false); }}
+        onSelect={p => { onWL?.(p.wc, p.ww); setShowPresets(false); }}
       />
 
-      {/* Colormap strip -- right edge */}
+      {/* Colormap strip — right edge */}
       <ColormapStrip
         paletteId={paletteId} palettes={palettes} wl={wl}
         modality={modality}
@@ -1311,22 +1249,22 @@ export default function ViewerBox({
         <OpacityHandle opacity={petOpacity} onChange={onOpacity} />
       )}
 
-      {/* MIP orientation bar -- A/P/R/L/H/F buttons, MIP viewport only */}
+      {/* MIP orientation bar — A/P/R/L/H/F buttons, MIP viewport only */}
       {modality === 'MIP' && (
         <MIPOrientationBar viewportId={viewportId} onStopRotation={() => setMipPlaying(false)} />
       )}
 
-      {/* Cine controls -- bottom of every box */}
+      {/* Cine controls — bottom of every box */}
       <CineBar
         viewportId={viewportId} modality={modality} isMIP={modality === 'MIP'}
         mipPlaying={mipPlaying} onMipPlayingChange={setMipPlaying}
       />
 
-      {/* (Removed) auto-appearing "N selected / Delete" toolbar -- it popped up
+      {/* (Removed) auto-appearing "N selected / Delete" toolbar — it popped up
           immediately after every draw. Deletion is now via right-click on the
           annotation, or the Del key while hovering this box. */}
 
-      {/* Clear all button -- bottom right */}
+      {/* Clear all button — bottom right */}
       <div
         onMouseDown={e => { e.stopPropagation(); _clearAllAnnotations(); }}
         title="Clear all annotations"
@@ -1338,9 +1276,9 @@ export default function ViewerBox({
         }}
         onMouseEnter={e => e.currentTarget.style.color = '#ff6666'}
         onMouseLeave={e => e.currentTarget.style.color = '#aaaaaa'}
-      >{String.fromCharCode(0x2298)}</div>
+      >⊘</div>
 
-      {/* Right-click delete popup -- only shows after a non-drag right click */}
+      {/* Right-click delete popup — only shows after a non-drag right click */}
       {deletePopup && (
         <div
           style={{
@@ -1359,13 +1297,13 @@ export default function ViewerBox({
             style={{ padding: '7px 12px', fontSize: 10, color: '#ff8888', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}
             onMouseEnter={e => e.currentTarget.style.background = '#1e1e1e'}
             onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-          ><span>x</span><span>Delete this annotation</span></div>
+          ><span>✕</span><span>Delete this annotation</span></div>
           <div
             onMouseDown={() => { _clearAllAnnotations(); setDeletePopup(null); }}
             style={{ padding: '7px 12px', fontSize: 10, color: '#cc6666', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, borderTop: '1px solid #1a1a1a' }}
             onMouseEnter={e => e.currentTarget.style.background = '#1e1e1e'}
             onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-          ><span>{String.fromCharCode(0x2298)}</span><span>Clear all in this box</span></div>
+          ><span>⊘</span><span>Clear all in this box</span></div>
           <div style={{ padding: '4px 10px', fontSize: 8, color: '#444', borderTop: '1px solid #1a1a1a' }}>
             Del key = delete selected
           </div>
@@ -1375,7 +1313,7 @@ export default function ViewerBox({
   );
 }
 
-// --- Orientation markers (R/L/A/P/S/I) ------------------------------------------
+// ─── Orientation markers (R/L/A/P/S/I) ──────────────────────────────────────────
 function OrientationMarkers({ orientation }) {
   const m = getOrientationMarkers(orientation);
   const base = {
@@ -1465,7 +1403,7 @@ function FusionOverlay({ fusionOffset }) {
   )
 }
 
-// --- Apply viewport properties ------------------------------------------------
+// ─── Apply viewport properties ────────────────────────────────────────────────
 function _voi(wl) {
   return { lower: wl.wc - wl.ww / 2, upper: wl.wc + wl.ww / 2 };
 }
@@ -1485,9 +1423,9 @@ function _applyProps(vp, wl, paletteId) {
   }
 }
 
-// --- Cine bar -- bottom of every viewport -------------------------------------
+// ─── Cine bar — bottom of every viewport ─────────────────────────────────────
 // For non-MIP viewports: cycles through slices (scroll cine).
-// For MIP viewport: rotates the camera around the Z-axis (360deg rotation).
+// For MIP viewport: rotates the camera around the Z-axis (360° rotation).
 //
 // MIP rotation strategy (Rule 12):
 //   The MIP is a volume viewport (ORTHOGRAPHIC + MAXIMUM_INTENSITY_BLEND).
@@ -1495,7 +1433,7 @@ function _applyProps(vp, wl, paletteId) {
 //   setCamera({ viewUp, position }) changes the projection direction.
 //   We keep the focal point at the volume centre and orbit the camera
 //   at a fixed radius around the IS (Z) axis, matching clinical convention
-//   where the patient rotates left->right in the coronal plane.
+//   where the patient rotates left→right in the coronal plane.
 //
 // Slice scroll cine for non-MIP (stack and volume modes):
 //   We use setInterval at the chosen fps and call vp.scroll(1) which works
@@ -1746,7 +1684,7 @@ function MIPOrientationBar({ viewportId, onStopRotation }) {
       if (!cam?.focalPoint) return
 
       const fp = cam.focalPoint
-      // Preserve current zoom. NEVER call resetCamera() -- it discards user zoom.
+      // Preserve current zoom. NEVER call resetCamera() — it discards user zoom.
       const parallelScale = cam.parallelScale
 
       // Compute current orbit radius (distance from camera to focal point).
@@ -1820,7 +1758,7 @@ function MIPOrientationBar({ viewportId, onStopRotation }) {
   )
 }
 
-// --- SUV bar ------------------------------------------------------------------
+// ─── SUV bar ──────────────────────────────────────────────────────────────────
 function SUVBar({ suvMin, suvMax, onSUV }) {
   const [lMin, setLMin] = useState(suvMin);
   const [lMax, setLMax] = useState(suvMax);
@@ -1849,7 +1787,7 @@ function SUVBar({ suvMin, suvMax, onSUV }) {
   );
 }
 
-// --- Colormap strip -----------------------------------------------------------
+// ─── Colormap strip ───────────────────────────────────────────────────────────
 function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, onEnterMenu, onLeaveMenu, onSelectPalette }) {
   const canvasRef = useRef();
   const dragRef   = useRef({ active: false, lastY: 0 });
@@ -1896,8 +1834,6 @@ function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, 
         borderLeft: `1px solid ${modality === 'MIP' ? '#cccccc' : '#333'}`,
         cursor: 'ns-resize', userSelect: 'none',
         background: modality === 'MIP' ? '#ffffff' : 'transparent',
-        overflow: 'visible',
-        zIndex: 20,
       }}
       onMouseDown={onMouseDown}
     >
@@ -1912,7 +1848,7 @@ function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, 
           borderTop: `1px solid ${modality === 'MIP' ? '#ccc' : '#333'}`,
           cursor: 'pointer',
         }}
-      >{String.fromCharCode(0x25b2)}map</div>
+      >▲map</div>
 
       {showMenu && (
         <div
@@ -1982,12 +1918,12 @@ function _groupPalettes(palettes) {
   return Object.entries(map).map(([g, ps]) => ({ label: labels[g] || g, palettes: ps }));
 }
 
-// --- Preset bar ---------------------------------------------------------------
+// ─── Preset bar ───────────────────────────────────────────────────────────────
 function PresetBar({ presets, accentColor, open, onEnter, onLeave, onSelect }) {
   return (
     <div onMouseEnter={onEnter} onMouseLeave={onLeave} onDoubleClick={e => e.stopPropagation()}
       style={{ position: 'absolute', bottom: 22, left: 8, zIndex: 60, userSelect: 'none' }}>
-      <span style={{ fontSize: 8, color: '#ffffff', cursor: 'default', textShadow: '0 1px 3px rgba(0,0,0,.9)' }}>{String.fromCharCode(0x2b21)} W/L</span>
+      <span style={{ fontSize: 8, color: '#ffffff', cursor: 'default', textShadow: '0 1px 3px rgba(0,0,0,.9)' }}>⬡ W/L</span>
       {open && (
         <div style={{
           position: 'absolute', bottom: '100%', left: 0, marginBottom: 3,
@@ -2013,19 +1949,19 @@ function PresetBar({ presets, accentColor, open, onEnter, onLeave, onSelect }) {
   );
 }
 
-// --- Opacity handle -----------------------------------------------------------
+// ─── Opacity handle ───────────────────────────────────────────────────────────
 function OpacityHandle({ opacity, onChange }) {
   return (
     <div style={{
       position: 'absolute', top: '50%', left: 4, transform: 'translateY(-50%)',
       display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
-      zIndex: 70, userSelect: 'none', width: 26,
+      zIndex: 70, userSelect: 'none',
     }}>
       <span style={{ fontSize: 8, color: '#88dd88', writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>blend</span>
       <input type="range" min={0} max={1} step={0.05} value={opacity}
         onChange={e => onChange(+e.target.value)}
         style={{ writingMode: 'vertical-lr', direction: 'rtl', width: 12, height: 60, accentColor: '#88dd88', cursor: 'pointer' }} />
-      <span style={{ fontSize: 8, color: '#88dd88', width: 26, textAlign: 'center', display: 'block' }}>{Math.round(opacity * 100)}%</span>
+      <span style={{ fontSize: 8, color: '#88dd88' }}>{Math.round(opacity * 100)}%</span>
     </div>
   );
 }

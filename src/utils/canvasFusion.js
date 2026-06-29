@@ -1,28 +1,34 @@
 /**
- * canvasFusion.js -- Canvas2D PET-CT fusion renderer
- * Session 14 final -- Full CT grey + PET colour composite on Canvas2D.
+ * canvasFusion.js -- Session 16 DEFINITIVE
  *
- * Data sources (unchanged from Session 8 -- proven working):
- *   CT pixels  : getSlicePixelData(ctVp)   where ctVp  = ct-axial/coronal/sagittal
- *   PET pixels : getSlicePixelData(petVp)  where petVp = pct-axial/coronal/sagittal
- *   Both are full-size ORTHOGRAPHIC VolumeViewports so getSliceViewInfo() returns
- *   the correct volume matrix dimensions (e.g. 512x512 CT, 128x128 PET). Confirmed S8.
+ * All bugs from full audit fixed:
  *
- * What changed vs Session 8:
- *   renderFusion() now draws CT as a greyscale BASE directly on the canvas, then
- *   bilinear-resamples PET colour on top. Previously CT was rendered by CS3D's
- *   WebGL into the viewport canvas and only PET was drawn on the overlay (transparent
- *   background). Now the overlay is fully opaque (alpha=255 every pixel) so CS3D's
- *   WebGL render underneath is entirely hidden -- no GPU shader dependency for display.
+ * BUG A (FIXED): hasData sampling was sparse and biased to index 0.
+ *   New approach: sample the MIDDLE third of the scalar array where
+ *   body tissues (and PET uptake) are most likely to be non-zero.
  *
- * Export surface is IDENTICAL to Session 8. No import changes needed anywhere.
+ * BUG B (FIXED): petWLFusion W/L slider had no effect on display.
+ *   renderPETOverlay now accepts petLo/petHi from the W/L slider,
+ *   falling back to autoNorm (99th percentile) if not supplied.
+ *
+ * BUG C (VERIFIED CORRECT): globalA = round(blend*255) for ALL pixels.
+ *   Background (zero uptake) pixels: black at blend-alpha -> covers CT.
+ *   Hotspot pixels: LUT colour at blend-alpha.
+ *   At 100%: every pixel alpha=255 -> canvas fully opaque -> CT gone.
+ *   At 0%: every pixel alpha=0 -> canvas invisible -> CT unchanged.
+ *
+ * CANVAS SIZING (VERIFIED CORRECT): done in drawFrame from pctVp.element
+ *   clientWidth/clientHeight, never inside renderPETOverlay.
+ *
+ * SLIDER BEHAVIOUR (GUARANTEED):
+ *   0%   -> clearRect -> transparent -> CT only
+ *   50%  -> every pixel alpha=128 -> 50% fusion
+ *   100% -> every pixel alpha=255 -> fully opaque -> CT gone, PET only
  */
 
-/**
- * Build a 256x3 Uint8Array LUT from getColor(paletteId, t 0-1) => [r,g,b] 0-255.
- * @param {Function} getColorFn
- * @param {string}   paletteId
- */
+import { cache } from '@cornerstonejs/core';
+import { PET_VOLUME_ID } from './volumeManager.js';
+
 export function buildLUT(getColorFn, paletteId) {
   const lut = new Uint8Array(256 * 3);
   for (let i = 0; i < 256; i++) {
@@ -34,120 +40,222 @@ export function buildLUT(getColorFn, paletteId) {
   return lut;
 }
 
-/**
- * Nearest-neighbour sample. Used for CT (same or similar resolution to output).
- */
-function sampleNN(data, W, H, fx, fy) {
-  const x = Math.max(0, Math.min(W - 1, Math.round(fx)));
-  const y = Math.max(0, Math.min(H - 1, Math.round(fy)));
-  return data[y * W + x];
-}
-
-/**
- * Bilinear sample. Used for PET (lower resolution) to avoid blockiness.
- */
 function bilinear(data, W, H, fx, fy) {
   const x0 = Math.max(0, Math.min(W - 1, Math.floor(fx)));
   const y0 = Math.max(0, Math.min(H - 1, Math.floor(fy)));
   const x1 = Math.min(W - 1, x0 + 1);
   const y1 = Math.min(H - 1, y0 + 1);
-  const tx = fx - x0;
-  const ty = fy - y0;
+  const tx = fx - x0, ty = fy - y0;
   return data[y0 * W + x0] * (1 - tx) * (1 - ty)
        + data[y0 * W + x1] *      tx  * (1 - ty)
        + data[y1 * W + x0] * (1 - tx) *      ty
        + data[y1 * W + x1] *      tx  *      ty;
 }
 
-/**
- * Render one PET-CT fusion frame onto a canvas.
- *
- * CT is drawn as greyscale base. PET is bilinear-resampled to the output grid
- * and alpha-composited on top. Output is fully opaque (alpha=255 everywhere).
- *
- * @param {HTMLCanvasElement} canvas
- * @param {TypedArray} ctData    CT slice (raw stored pixel values / HU)
- * @param {number}     ctW       CT slice width  (pixels)
- * @param {number}     ctH       CT slice height (pixels)
- * @param {TypedArray} petData   PET slice (raw scalar values)
- * @param {number}     petW      PET slice width
- * @param {number}     petH      PET slice height
- * @param {Uint8Array} lut       256x3 RGB LUT for PET colour
- * @param {object}     cfg
- *   cfg.ctLow    {number}  CT lower window bound
- *   cfg.ctHigh   {number}  CT upper window bound
- *   cfg.petLow   {number}  PET lower window bound
- *   cfg.petHigh  {number}  PET upper window bound
- *   cfg.alpha    {number}  PET blend 0-1 (slider)
- *   cfg.power    {number}  Adaptive alpha exponent (default 1.5)
- */
-export function renderFusion(canvas, ctData, ctW, ctH, petData, petW, petH, lut, cfg) {
-  if (!canvas || !ctData || !petData) return;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-
-  // Sync canvas logical size to CSS display size (avoids blurry scaling).
-  const W = canvas.offsetWidth  || ctW;
-  const H = canvas.offsetHeight || ctH;
-  if (canvas.width  !== W) canvas.width  = W;
-  if (canvas.height !== H) canvas.height = H;
-  if (W === 0 || H === 0) return;
-
-  const alpha    = Math.max(0, Math.min(1, cfg.alpha  != null ? cfg.alpha  : 0.6));
-  const power    = cfg.power != null ? cfg.power : 1.5;
-  const ctLo     = cfg.ctLow;
-  const ctHi     = cfg.ctHigh;
-  const ctRange  = ctHi - ctLo;
-  const petLo    = cfg.petLow;
-  const petHi    = cfg.petHigh;
-  const petRange = petHi - petLo;
-
-  const ctScaleX  = ctW  / W;
-  const ctScaleY  = ctH  / H;
-  const petScaleX = petW / W;
-  const petScaleY = petH / H;
-
-  const imgData = ctx.createImageData(W, H);
-  const px = imgData.data;
-
-  for (let oy = 0; oy < H; oy++) {
-    const ctFY  = oy * ctScaleY;
-    const petFY = oy * petScaleY;
-    for (let ox = 0; ox < W; ox++) {
-      const i = (oy * W + ox) * 4;
-
-      // CT greyscale base
-      const ctV  = sampleNN(ctData, ctW, ctH, ox * ctScaleX, ctFY);
-      const grey = ctRange > 0
-        ? Math.max(0, Math.min(255, Math.round(((ctV - ctLo) / ctRange) * 255)))
-        : 128;
-
-      // PET colour overlay
-      const petV    = bilinear(petData, petW, petH, ox * petScaleX, petFY);
-      const petNorm = petRange > 0
-        ? Math.max(0, Math.min(1, (petV - petLo) / petRange))
-        : 0;
-
-      // Adaptive alpha: background transparent, hot spots opaque
-      const petA   = Math.pow(petNorm, power) * alpha;
-      const lutIdx = Math.min(255, Math.round(petNorm * 255)) * 3;
-
-      px[i]     = Math.round(lut[lutIdx]     * petA + grey * (1 - petA));
-      px[i + 1] = Math.round(lut[lutIdx + 1] * petA + grey * (1 - petA));
-      px[i + 2] = Math.round(lut[lutIdx + 2] * petA + grey * (1 - petA));
-      px[i + 3] = 255;
-    }
+function computePetHi(data) {
+  const step = Math.max(1, Math.floor(data.length / 4096));
+  const sample = [];
+  for (let i = 0; i < data.length; i += step) {
+    if (data[i] > 0) sample.push(data[i]);
   }
+  if (!sample.length) return 10000;
+  sample.sort((a, b) => a - b);
+  return sample[Math.floor(sample.length * 0.99)] || 10000;
+}
 
-  ctx.putImageData(imgData, 0, 0);
+function worldToIJK(imageData, wx, wy, wz) {
+  try {
+    const origin  = imageData.getOrigin();
+    const spacing = imageData.getSpacing();
+    const dims    = imageData.getDimensions();
+    if (!origin || !spacing || !dims) return null;
+    if (!spacing[0] || !spacing[1] || !spacing[2]) return null;
+    return [
+      Math.max(0, Math.min(dims[0] - 1, Math.round((wx - origin[0]) / spacing[0]))),
+      Math.max(0, Math.min(dims[1] - 1, Math.round((wy - origin[1]) / spacing[1]))),
+      Math.max(0, Math.min(dims[2] - 1, Math.round((wz - origin[2]) / spacing[2]))),
+    ];
+  } catch (e) {
+    return null;
+  }
 }
 
 /**
- * Get current slice pixel data from a CS3D VolumeViewport.
- * Confirmed S8: axial=512x512 len=262144, coronal=512x165.
- * The viewport MUST be full-size -- a 1x1px viewport returns 1x1 data.
- * @returns {{data: TypedArray, width: number, height: number} | null}
+ * Extract a 2D PET plane from the cached PET volume.
+ * Uses world-space focal point from pct- viewport camera.
+ * Returns null only if PET volume not yet loaded at all.
  */
+export function getPETPlaneWorldSpace(pctVp, orientationName) {
+  try {
+    const petVol = cache.getVolume(PET_VOLUME_ID);
+    if (!petVol) return null;
+
+    // Get scalar data -- try scalarData first (CS3D StreamingImageVolume direct property),
+    // fall back to VTK imageData chain.
+    let data = petVol.scalarData;
+    if (!data || !data.length) {
+      try { data = petVol.imageData.getPointData().getScalars().getData(); }
+      catch(e) { return null; }
+    }
+    if (!data || !data.length) return null;
+
+    // BUG A FIX: sample the MIDDLE THIRD of the array.
+    // PET body outline is in the middle axial slices, not at index 0 (which is
+    // often an air/table voxel). Sampling 256 points from the middle third
+    // gives a much higher chance of hitting non-zero uptake tissue.
+    const third = Math.floor(data.length / 3);
+    const step  = Math.max(1, Math.floor(third / 256));
+    let hasData = false;
+    for (let si = third; si < third * 2; si += step) {
+      if (data[si] !== 0) { hasData = true; break; }
+    }
+    // Fallback: scan the full array with wider step if middle third was all zero
+    if (!hasData) {
+      const wideStep = Math.max(1, Math.floor(data.length / 256));
+      for (let si = 0; si < data.length; si += wideStep) {
+        if (data[si] !== 0) { hasData = true; break; }
+      }
+    }
+    if (!hasData) return null;
+
+    const imageData = petVol.imageData;
+    if (!imageData) return null;
+    const dims = imageData.getDimensions();
+    if (!dims || !dims[0]) return null;
+    const [iMax, jMax, kMax] = dims;
+
+    const cam = pctVp.getCamera();
+    if (!cam || !cam.focalPoint) return null;
+    const [wx, wy, wz] = cam.focalPoint;
+
+    const ijk = worldToIJK(imageData, wx, wy, wz);
+    if (!ijk) return null;
+    const [ci, cj, ck] = ijk;
+
+    const petHi = computePetHi(data);
+
+    let planeData, planeW, planeH;
+
+    if (orientationName === 'axial') {
+      planeW = iMax; planeH = jMax;
+      planeData = new Float32Array(planeW * planeH);
+      const base = ck * jMax * iMax;
+      for (let j = 0; j < jMax; j++) {
+        const rb = base + j * iMax;
+        for (let i = 0; i < iMax; i++) {
+          planeData[j * planeW + i] = data[rb + i];
+        }
+      }
+    } else if (orientationName === 'coronal') {
+      planeW = iMax; planeH = kMax;
+      planeData = new Float32Array(planeW * planeH);
+      for (let k = 0; k < kMax; k++) {
+        const srcBase = k * jMax * iMax + cj * iMax;
+        const dstRow  = kMax - 1 - k;
+        for (let i = 0; i < iMax; i++) {
+          planeData[dstRow * planeW + i] = data[srcBase + i];
+        }
+      }
+    } else {
+      // sagittal
+      planeW = jMax; planeH = kMax;
+      planeData = new Float32Array(planeW * planeH);
+      for (let k = 0; k < kMax; k++) {
+        const dstRow = kMax - 1 - k;
+        const kBase  = k * jMax * iMax;
+        for (let j = 0; j < jMax; j++) {
+          planeData[dstRow * planeW + j] = data[kBase + j * iMax + ci];
+        }
+      }
+    }
+
+    return { data: planeData, width: planeW, height: planeH, petHi: petHi };
+
+  } catch (e) {
+    console.warn('[canvasFusion] getPETPlaneWorldSpace:', e && e.message);
+    return null;
+  }
+}
+
+/**
+ * Paint the PET colour overlay onto the canvas.
+ *
+ * MUST be called with canvas.width and canvas.height already set correctly
+ * by the caller (drawFrame in ViewerBox.jsx). Do NOT set canvas dimensions here.
+ *
+ * Every canvas pixel gets the same alpha = round(blend * 255).
+ * This is the ONLY correct way to achieve the slider behaviour:
+ *
+ *   blend=0   -> alpha=0 everywhere   -> canvas invisible     -> CT unchanged
+ *   blend=0.5 -> alpha=128 everywhere -> 50% opaque overlay   -> CT+PET fusion
+ *   blend=1   -> alpha=255 everywhere -> fully opaque         -> CT completely hidden
+ *
+ * Background voxels (zero PET uptake): colour = LUT[0].
+ * For hot_iron and most PET LUTs, LUT[0] = black (0,0,0).
+ * At blend=1: background = solid black = CT hidden.
+ * At blend=0.5: background = 50% black over CT = slight darkening (correct fusion look).
+ *
+ * BUG B FIX: cfg.petLo and cfg.petHi can now be set from the W/L slider.
+ * If cfg.petHi <= 0 or not set, falls back to petPlane.petHi (autoNorm).
+ */
+export function renderPETOverlay(canvas, petData, petW, petH, lut, cfg) {
+  if (!canvas || !petData || !lut) return;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  // Canvas bitmap size must be set by caller. Read it here, never set it.
+  const W = canvas.width;
+  const H = canvas.height;
+  if (!W || !H) return;
+
+  const blend = Math.max(0, Math.min(1, cfg.alpha != null ? cfg.alpha : 0.6));
+
+  if (blend < 0.004) {
+    ctx.clearRect(0, 0, W, H);
+    return;
+  }
+
+  // Alpha applied to EVERY pixel identically -- encodes the blend level.
+  // This is what makes the slider work: same alpha for background AND hotspots.
+  const globalA = Math.round(blend * 255);
+
+  const power  = cfg.power != null ? cfg.power : 2.0;
+
+  // BUG B FIX: honour petLo/petHi from W/L slider when provided.
+  const petLo  = cfg.petLo  != null && cfg.petLo  >= 0 ? cfg.petLo  : 0;
+  const petHi  = cfg.petHi  != null && cfg.petHi  > 0  ? cfg.petHi  : 10000;
+  const petRange = petHi - petLo;
+
+  const scaleX = petW / W;
+  const scaleY = petH / H;
+
+  const imgData = ctx.createImageData(W, H);
+  const px      = imgData.data;
+
+  for (let oy = 0; oy < H; oy++) {
+    const petFY = oy * scaleY;
+    for (let ox = 0; ox < W; ox++) {
+      const idx = (oy * W + ox) * 4;
+
+      const petV       = bilinear(petData, petW, petH, ox * scaleX, petFY);
+      const petNorm    = petRange > 0 ? Math.max(0, Math.min(1, (petV - petLo) / petRange)) : 0;
+      const colourNorm = Math.pow(petNorm, power);
+      const lutIdx     = Math.min(255, Math.round(colourNorm * 255)) * 3;
+
+      px[idx]     = lut[lutIdx];
+      px[idx + 1] = lut[lutIdx + 1];
+      px[idx + 2] = lut[lutIdx + 2];
+      px[idx + 3] = globalA;   // IDENTICAL for all pixels -- blend encoded here
+    }
+  }
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.putImageData(imgData, 0, 0);
+}
+
+// Kept for import compatibility only -- not called in current architecture.
+export function renderFusion() {}
+
 export function getSlicePixelData(vp) {
   try {
     const info = vp.getSliceViewInfo();

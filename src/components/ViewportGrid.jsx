@@ -264,11 +264,18 @@ function _syncMIPZoom(engine) {
   const poll = setInterval(() => {
     attempts++;
     try {
-      const mipVP = engine.getViewport('mip');
-      const cam   = mipVP?.getCamera();
-      if (cam?.parallelScale > 100) {
-        window.__mipScale = cam.parallelScale;
-        console.log('[MIPZoom] parallelScale locked:', window.__mipScale);
+      const mipVP   = engine.getViewport('mip');
+      const ctCorVp = engine.getViewport('ct-coronal');
+      const mipCam  = mipVP?.getCamera();
+      const ctCam   = ctCorVp?.getCamera();
+      if (mipCam?.parallelScale > 100 && ctCam?.parallelScale > 100) {
+        // Match MIP zoom to ct-coronal so anatomy appears same size.
+        // ct-coronal parallelScale is the reference anatomical zoom.
+        const targetScale = ctCam.parallelScale;
+        mipVP.setCamera({ ...mipCam, parallelScale: targetScale });
+        mipVP.render();
+        window.__mipScale = targetScale;
+        console.log('[MIPZoom] parallelScale matched to ct-coronal:', targetScale);
         clearInterval(poll);
       }
     } catch(e) {}
@@ -387,6 +394,45 @@ export default function ViewportGrid({
         const engine = getRenderingEngine(RENDERING_ENGINE_ID);
         if (engine) _syncMIPZoom(engine);
 
+        // CT/PET size parity: copy parallelScale from each CT viewport to
+        // its matching PET-CT viewport after 500ms (cameras stable by then).
+        setTimeout(() => {
+          try {
+            const eng = getRenderingEngine(RENDERING_ENGINE_ID);
+            if (!eng) return;
+            const pairs = [
+              ['ct-axial',    'pct-axial'],
+              ['ct-coronal',  'pct-coronal'],
+              ['ct-sagittal', 'pct-sagittal'],
+            ];
+            for (const [ctId, petId] of pairs) {
+              const ctVp  = eng.getViewport(ctId);
+              const petVp = eng.getViewport(petId);
+              if (!ctVp || !petVp) continue;
+              const ctCam  = ctVp.getCamera();
+              if (!ctCam?.parallelScale) continue;
+              const petCam = petVp.getCamera();
+              petVp.setCamera({ ...petCam, parallelScale: ctCam.parallelScale });
+              petVp.render();
+            }
+            // MIP zoom: MIP column spans 2 rows so parallelScale x2 matches CT size.
+            const ctCorVp = eng.getViewport('ct-coronal');
+            const mipVp   = eng.getViewport('mip');
+            if (ctCorVp && mipVp) {
+              const ctCorCam = ctCorVp.getCamera();
+              const mipCam   = mipVp.getCamera();
+              if (ctCorCam?.parallelScale && mipCam) {
+                const targetScale = ctCorCam.parallelScale * 2;
+                mipVp.setCamera({ ...mipCam, parallelScale: targetScale });
+                try { mipVp.resize(); } catch(e) {}
+                mipVp.render();
+                window.__mipScale = targetScale;
+                console.log('[MIPZoom] matched to ct-coronal x2:', targetScale);
+              }
+            }
+          } catch(e) {}
+        }, 500);
+
         if (onMetaLoaded) {
           onMetaLoaded({
             patientName: _parseName(sList[0]?.['00100010']?.Value?.[0]),
@@ -440,7 +486,7 @@ export default function ViewportGrid({
       display: 'grid', flex: 1,
       gridTemplateColumns: layoutDef.gridTemplateColumns,
       gridTemplateRows:    layoutDef.gridTemplateRows,
-      gap: 2, padding: 2, background: '#000',
+      gap: 2, padding: 2, background: '#ffffff',
       minHeight: 0, height: '100%',
     }}>
       {activeSlots.map(({ slotIdx, vpDef, gridColumn, gridRow }) => {
@@ -463,6 +509,7 @@ export default function ViewportGrid({
             display: 'flex', flexDirection: 'column', position: 'relative',
             gridColumn: gridColumn || undefined, gridRow: gridRow || undefined,
             minHeight: 0,
+            background: vpDef.modality === 'MIP' ? '#ffffff' : undefined,
           }}>
             <ViewerBox
               viewportId={vpDef.id}

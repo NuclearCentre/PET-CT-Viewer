@@ -1262,7 +1262,7 @@ export default function App() {
   const [ctWL,            setCTWL]            = useState(DEF_CT_WL)
   const [petWL,           setPETWL]           = useState(DEF_PET_WL)
   const [suv,             setSUV]             = useState(DEF_SUV)
-  const [petOpacity,      setPetOpacity]      = useState(0.6)
+  const [petOpacity,      setPetOpacity]      = useState(0.5)
   const [activeTool,      setActiveTool]      = useState(null)
   const [sync,            setSync]            = useState({ scroll: true, zoom: false, pan: false })
   const [expandedId,      setExpandedId]      = useState(null)
