@@ -24,6 +24,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import {
   getRenderingEngine,
+  cache,
   Enums as CoreEnums,
   eventTarget,
   getEnabledElementByViewportId,
@@ -47,11 +48,13 @@ import { getColor, getCssGradient, CT_PALETTES, PET_PALETTES } from '../utils/co
 import {
   ORIENTATION,
   CT_VOLUME_ID,
+  PET_VOLUME_ID,
   applyCTVolume,
   applyFusionVolumes,
   applyMIPVolume,
   setFusionPetProperties,
   setFusionCtVOI,
+  updateFusionCtWL,
   setPetOpacity,
   getOrientationMarkers,
 } from '../utils/volumeManager.js';
@@ -113,9 +116,9 @@ const CT_PRESETS = [
   { label:'Sinuses',     ww:3000, wc:500  },
 ];
 const PET_PRESETS = [
-  { label:'Standard',    ww:10000, wc:5000  },
-  { label:'High uptake', ww:5000,  wc:2500  },
-  { label:'Low uptake',  ww:20000, wc:10000 },
+  { label:'Standard',    ww:50000, wc:25000 },
+  { label:'High uptake', ww:25000, wc:12500 },
+  { label:'Low uptake',  ww:100000,wc:50000 },
 ];
 
 export default function ViewerBox({
@@ -135,19 +138,19 @@ export default function ViewerBox({
   activeToolOverride = null,
   isExpanded = false,
   onDoubleClick,
-  // Sync flags passed from parent
   syncScroll = true,
   syncZoom   = false,
   syncPan    = false,
-  // -- Phase 3 -- volume / MPR / fusion --------------------------------------
-  renderMode = 'stack',          // 'stack' (Phase 1/2) | 'volume' (Phase 3)
-  orientation = 'axial',         // 'axial' | 'coronal' | 'sagittal'
-  volumesReady = false,          // gate: volumes built before we render
-  ctWLFusion,                    // CT base W/L for fusion viewports
-  petWLFusion,                   // PET overlay W/L for fusion viewports
-  // -- Phase 4 -- fusion mode controls
-  fusionMode = 'auto',           // 'auto' | 'manual'
+  renderMode = 'stack',
+  orientation = 'axial',
+  volumesReady = false,
+  ctWLFusion,
+  petWLFusion,
+  fusionMode = 'auto',
   fusionOffset = { tx:0,ty:0,tz:0,rx:0,ry:0,rz:0 },
+  // Palette sync: parent can override local palette (for pct- sync)
+  paletteOverride = null,
+  onPaletteChange = null,
 }) {
   const divRef      = useRef(null);
   const hasVP          = useRef(false);
@@ -159,10 +162,13 @@ export default function ViewerBox({
   //  ctWLFusion, petWLFusion would be stale if captured directly in the closure).
   const petOpacityRef    = useRef(0.6);
   const ctWLFusionRef    = useRef({ wc: 40,   ww: 400   });
-  const petWLFusionRef   = useRef({ wc: 5000, ww: 10000 });
+  const petWLFusionRef   = useRef({ wc: 25000, ww: 50000 });
+  const orientationRef   = useRef(orientation);  // avoids stale closure in drawFrame
   const glFramePending = useRef(false);  // rAF dedup
 
   const [paletteId, setPaletteId]     = useState(DEFAULT_COLORMAP[modality] || 'gray');
+  // If parent supplies paletteOverride (for pct- sync), use it
+  const effectivePaletteId = (paletteOverride && modality === 'PET') ? paletteOverride : paletteId;
   const [showPalMenu, setShowPalMenu] = useState(false);
   const [showPresets, setShowPresets] = useState(false);
   const [sliceInfo, setSliceInfo]     = useState({ current: 0, total: 0 });
@@ -252,13 +258,10 @@ export default function ViewerBox({
       if (isVolume) {
         // -- Phase 3 -- volume / MPR / fusion ---------------------------------
         if (modality === 'CT') {
-          await applyCTVolume(vp, { wl, colormapName: `petct_${paletteId}` });
+          await applyCTVolume(vp, { wl, colormapName: `petct_${effectivePaletteId}` });
         } else if (modality === 'PET') {
           await applyFusionVolumes(vp, {
-            ctWL:  ctWLFusion  || { wc: 40,   ww: 400   },
-            petWL: petWLFusion || wl,
-            petColormapName: `petct_${paletteId}`,
-            petOpacity,
+            ctWL: ctWLFusion || { wc: 40, ww: 400 },
           });
 
         } else { // MIP
@@ -297,7 +300,7 @@ export default function ViewerBox({
         // -- Phase 1/2 -- stack -----------------------------------------------
         await vp.setStack(imageIds, 0);
         vp.resetCamera();
-        _applyProps(vp, wl, paletteId);
+        _applyProps(vp, wl, effectivePaletteId);
         vp.render();
         hasVP.current = true;
 
@@ -351,21 +354,81 @@ export default function ViewerBox({
     if (!canvas) return;
 
     // Fusion canvas uses inv_hot_iron (white=high uptake, black=zero uptake).
-    glLUTRef.current = buildLUT(getColor, 'inv_hot_iron');
+    glLUTRef.current = buildLUT(getColor, effectivePaletteId);
 
     function drawFrame() {
       glFramePending.current = false;
       try {
-        // PET intensity slider -- CS3D renders PET natively in pct- viewport.
-        // divRef.style.opacity = blend fades only the PET image.
-        // Black ViewerBox background is behind divRef and never changes.
-        // blend=0 -> PET invisible. blend=1 -> PET full intensity.
         const blend = Math.max(0, Math.min(1, petOpacityRef.current));
-        if (divRef.current) divRef.current.style.opacity = String(blend);
-        const ctx = canvas.getContext('2d');
-        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const el    = divRef.current;
+        if (!canvas || !el) return;
+
+        const cw = el.clientWidth  || el.offsetWidth;
+        const ch = el.clientHeight || el.offsetHeight;
+        if (!cw || !ch) return;
+        if (canvas.width !== cw || canvas.height !== ch) {
+          canvas.width  = cw;
+          canvas.height = ch;
+        }
+
+        if (blend < 0.004) {
+          const ctx = canvas.getContext('2d');
+          if (ctx) ctx.clearRect(0, 0, cw, ch);
+          return;
+        }
+
+        const engine = getRenderingEngine(RENDERING_ENGINE_ID);
+        const pctVp  = engine?.getViewport(viewportId);
+        if (!pctVp) return;
+
+        const petPlane = getPETPlaneWorldSpace(pctVp, orientationRef.current);
+        if (!petPlane) {
+          const ctx = canvas.getContext('2d');
+          if (ctx) ctx.clearRect(0, 0, cw, ch);
+          return;
+        }
+
+        const lut = glLUTRef.current;
+        if (!lut) return;
+
+        // Compute viewport camera world bounds for world-space pixel mapping
+        let vpBounds = null;
+        const focalPt = [0, 0, 0];
+        try {
+          const cam2   = pctVp.getCamera();
+          const fp     = cam2.focalPoint;
+          focalPt[0] = fp[0]; focalPt[1] = fp[1]; focalPt[2] = fp[2];
+          const ps     = cam2.parallelScale;
+          const aspect = cw / ch;
+          const orient = orientationRef.current;
+
+          if (orient === 'axial') {
+            vpBounds = { xMin: fp[0]-ps*aspect, xMax: fp[0]+ps*aspect, yMin: fp[1]-ps, yMax: fp[1]+ps };
+          } else if (orient === 'coronal') {
+            vpBounds = { xMin: fp[0]-ps*aspect, xMax: fp[0]+ps*aspect, yMin: fp[2]-ps, yMax: fp[2]+ps };
+          } else {
+            vpBounds = { xMin: fp[1]-ps*aspect, xMax: fp[1]+ps*aspect, yMin: fp[2]-ps, yMax: fp[2]+ps };
+          }
+        } catch(e) {}
+
+        renderPETOverlay(canvas, petPlane.data, petPlane.width, petPlane.height, lut, {
+          alpha:        blend,
+          petLo:        0,
+          petHi:        petPlane.petHi,
+          power:        2.0,
+          vpBounds,
+          petImageData: petPlane.petImageData,
+          fullData:     petPlane.fullData,
+          orientation:  petPlane.orientation,
+          iMax:         petPlane.iMax,
+          jMax:         petPlane.jMax,
+          kMax:         petPlane.kMax,
+          focalX:       focalPt[0],
+          focalY:       focalPt[1],
+          focalZ:       focalPt[2],
+        });
       } catch(e) {
-        console.warn('[canvasFusion] drawFrame:', e && e.message);
+        console.warn('[canvasFusion] drawFrame error:', e?.message);
       }
     }
     function onRendered() {
@@ -375,12 +438,48 @@ export default function ViewerBox({
     }
 
     const el = divRef.current;
-    if (el) el.addEventListener(Events.IMAGE_RENDERED, onRendered);
+    if (el) {
+      el.addEventListener(Events.IMAGE_RENDERED, onRendered);
+      // Repaint on camera change (pan/zoom) so overlay stays in sync with CT
+      el.addEventListener(Events.CAMERA_MODIFIED, onRendered);
+    }
+
+    // Poll until PET voxelManager has non-zero data (streaming in progress)
+    // Start after 2s to avoid colliding with MIP zoom sync (500ms timer in ViewportGrid)
+    let pollCount = 0;
+    const retryPoll = setInterval(() => {
+      pollCount++;
+      try {
+        const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId);
+        if (!vp) return;
+        const petVol = cache.getVolume(PET_VOLUME_ID);
+        if (!petVol) return;
+
+        let raw = petVol.scalarData;
+        if (!raw?.length) raw = petVol.voxelManager?.scalarData;
+        if (!raw?.length && typeof petVol.voxelManager?.getCompleteScalarDataArray === 'function') {
+          try { raw = petVol.voxelManager.getCompleteScalarDataArray(); } catch(e) {}
+        }
+        if (!raw?.length) return;
+
+        const step = Math.max(1, Math.floor(raw.length / 2000));
+        for (let i = 0; i < raw.length; i += step) {
+          if (raw[i] !== 0) {
+            clearInterval(retryPoll);
+            vp.render();
+            return;
+          }
+        }
+      } catch(e) {}
+      if (pollCount >= 58) { clearInterval(retryPoll); }
+    }, 2000);
+
     return () => {
-      if (el) el.removeEventListener(Events.IMAGE_RENDERED, onRendered);
-      // Reset divRef (CT) back to visible and clear canvas on unmount
-      try { if (divRef.current) divRef.current.style.opacity = '1'; } catch(e) {}
-      try { canvas.style.opacity = '0'; } catch(e) {}
+      if (el) {
+        el.removeEventListener(Events.IMAGE_RENDERED, onRendered);
+        el.removeEventListener(Events.CAMERA_MODIFIED, onRendered);
+      }
+      clearInterval(retryPoll);
       try {
         const ctx = canvas.getContext('2d');
         ctx?.clearRect(0, 0, canvas.width, canvas.height);
@@ -394,7 +493,7 @@ export default function ViewerBox({
   useEffect(() => {
     if (modality !== 'PET' || !isVolume) return;
     // Fusion canvas uses inv_hot_iron (white=high uptake, black=zero uptake).
-    glLUTRef.current = buildLUT(getColor, 'inv_hot_iron');
+    glLUTRef.current = buildLUT(getColor, effectivePaletteId);
     try { getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)?.render(); } catch(e) {}
   }, [paletteId]);
 
@@ -404,6 +503,7 @@ export default function ViewerBox({
   petOpacityRef.current  = petOpacity;
   ctWLFusionRef.current  = ctWLFusion  || { wc: 40,   ww: 400   };
   petWLFusionRef.current = petWLFusion || wl;
+  orientationRef.current = orientation;
 
   // -- Sync flag changes -> add/remove from synchronizers --------------------
   useEffect(() => {
@@ -431,13 +531,16 @@ export default function ViewerBox({
       const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId);
       if (!vp) return;
       if (isVolume) {
-        const cmap = `petct_${paletteId}`;
+        const cmap = `petct_${effectivePaletteId}`;
         if (modality === 'CT') {
           try { vp.setProperties({ voiRange: _voi(wl), colormap: { name: cmap } }); }
           catch(e) { vp.setProperties({ voiRange: _voi(wl) }); }
         } else if (modality === 'PET') {
-          // CT VOI update only -- Canvas2D handles colour.
-          try { setFusionCtVOI(vp, ctWLFusion || { wc:40, ww:400 }); } catch(e) {}
+          // updateFusionCtWL targets CT actor directly by referencedId — safe on
+          // two-volume viewport. setFusionCtVOI (single-arg setProperties) must
+          // NOT be used here — it hits whichever volume CS3D considers current,
+          // which corrupts the PET VOI range and makes the overlay invisible.
+          try { updateFusionCtWL(vp, ctWLFusion || { wc: 40, ww: 400 }); } catch(e) {}
           setFusionPetProperties(vp, { petWL: petWLFusion || wl, petColormapName: cmap, petOpacity });
         } else { // MIP
           try { vp.setProperties({ voiRange: _voi(wl), colormap: { name: cmap } }); }
@@ -445,7 +548,7 @@ export default function ViewerBox({
         }
         vp.render();
       } else {
-        _applyProps(vp, wl, paletteId);
+        _applyProps(vp, wl, effectivePaletteId);
         vp.render();
       }
     } catch(e) {}
@@ -1203,20 +1306,22 @@ export default function ViewerBox({
           style={{
             position: 'absolute', inset: 0,
             overflow: 'hidden',
-            clipPath: 'inset(0)',   // clips SVG annotation labels at this div's edge
+            clipPath: 'inset(0)',
             background: modality === 'MIP' ? '#ffffff' : '#000000',
           }}
         />
-      </div>
 
-      {/* Canvas2D fusion overlay -- drawn on IMAGE_RENDERED, transparent until then */}
-      {modality === 'PET' && isVolume && (
-        <canvas ref={glCanvasRef} style={{
-          position: 'absolute', inset: 0,
-          width: '100%', height: '100%',
-          pointerEvents: 'none', zIndex: 6,
-        }} />
-      )}
+        {/* Canvas2D PET fusion overlay — INSIDE position:relative so inset:0
+            places it exactly over the WebGL canvas. pointer-events:none passes
+            all mouse events through to CS3D underneath. */}
+        {modality === 'PET' && isVolume && (
+          <canvas ref={glCanvasRef} style={{
+            position: 'absolute', inset: 0,
+            width: '100%', height: '100%',
+            pointerEvents: 'none', zIndex: 6,
+          }} />
+        )}
+      </div>
 
       {/* Fusion alignment overlay -- manual mode, PET-CT viewports only.
           Dashed blue crosshair giving visual feedback that the PET layer is being
@@ -1282,7 +1387,7 @@ export default function ViewerBox({
         pointerEvents: 'none', userSelect: 'none',
         textShadow: '0 1px 3px rgba(0,0,0,.9)',
       }}>
-        W:{wl.ww} L:{wl.wc}
+        W:{wl?.ww != null ? (wl.ww >= 1000 ? (wl.ww/1000).toFixed(0)+'K' : wl.ww) : '—'} L:{wl?.wc != null ? (wl.wc >= 1000 ? (wl.wc/1000).toFixed(0)+'K' : wl.wc) : '—'}
       </div>
 
       {/* SUV bar -- PET only */}
@@ -1299,11 +1404,16 @@ export default function ViewerBox({
 
       {/* Colormap strip -- right edge */}
       <ColormapStrip
-        paletteId={paletteId} palettes={palettes} wl={wl}
+        paletteId={effectivePaletteId} palettes={palettes} wl={wl}
         modality={modality}
         onWLDrag={(c,w) => onWL?.(c,w)}
         showMenu={showPalMenu} onEnterMenu={openPal} onLeaveMenu={closePal}
-        onSelectPalette={id => { setPaletteId(id); setShowPalMenu(false); }}
+        onSelectPalette={id => {
+          setPaletteId(id);
+          setShowPalMenu(false);
+          // PET: notify parent to sync all 3 pct- boxes (not MIP — no onPaletteChange passed for MIP)
+          if (modality === 'PET' && onPaletteChange) onPaletteChange(id);
+        }}
       />
 
       {/* PET opacity slider */}
@@ -1470,7 +1580,7 @@ function _voi(wl) {
   return { lower: wl.wc - wl.ww / 2, upper: wl.wc + wl.ww / 2 };
 }
 
-function _applyProps(vp, wl, paletteId) {
+function _applyProps(vp, wl, effectivePaletteId) {
   try {
     vp.setProperties({
       voiRange: { lower: wl.wc - wl.ww / 2, upper: wl.wc + wl.ww / 2 },
@@ -1901,28 +2011,35 @@ function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, 
       }}
       onMouseDown={onMouseDown}
     >
-      <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
+      {/* Palette selector button — TOP of strip, always visible */}
       <div
         onMouseEnter={onEnterMenu} onMouseLeave={onLeaveMenu}
+        onMouseDown={e => { e.stopPropagation(); e.preventDefault(); }}
+        onClick={e => { e.stopPropagation(); onEnterMenu(); }}
+        title="Change colour palette"
         style={{
-          position: 'absolute', bottom: 0, left: 0, right: 0,
-          background: modality === 'MIP' ? 'rgba(240,240,240,.95)' : 'rgba(0,0,0,.85)',
-          fontSize: 7, color: modality === 'MIP' ? '#333' : '#aaa',
-          textAlign: 'center', padding: '2px 0',
-          borderTop: `1px solid ${modality === 'MIP' ? '#ccc' : '#333'}`,
-          cursor: 'pointer',
+          position: 'absolute', top: 0, left: 0, right: 0, height: 18,
+          background: modality === 'MIP' ? 'rgba(220,220,220,.97)' : 'rgba(0,0,0,.85)',
+          fontSize: 8, color: modality === 'MIP' ? '#333' : '#00e5ff',
+          textAlign: 'center', lineHeight: '18px',
+          borderBottom: `1px solid ${modality === 'MIP' ? '#ccc' : '#444'}`,
+          cursor: 'pointer', zIndex: 25, userSelect: 'none',
+          fontWeight: 'bold', letterSpacing: 0.5,
         }}
-      >{String.fromCharCode(0x25b2)}map</div>
+      >&#9660;pal</div>
+
+      <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', marginTop: 18 }} />
 
       {showMenu && (
         <div
           onMouseEnter={onEnterMenu} onMouseLeave={onLeaveMenu}
           onDoubleClick={e => e.stopPropagation()}
           style={{
-            position: 'absolute', bottom: 14, right: '100%', marginRight: 2,
+            position: 'absolute', top: 18, right: '100%', marginRight: 2,
             background: 'rgba(12,12,12,.97)', border: '1px solid #444',
             borderRadius: 4, boxShadow: '-4px 4px 20px rgba(0,0,0,.9)',
             whiteSpace: 'nowrap', zIndex: 80, minWidth: 160,
+            maxHeight: 300, overflowY: 'auto',
           }}
         >
           {groups.map(grp => (
@@ -1944,7 +2061,7 @@ function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, 
                     onMouseEnter={e => { if (!active) e.currentTarget.style.background = '#1a1a1a'; }}
                     onMouseLeave={e => { if (!active) e.currentTarget.style.background = 'transparent'; }}
                   >
-                    <div style={{ width: 10, height: 32, borderRadius: 1, background: getCssGradient(p.id), border: '1px solid #333', flexShrink: 0 }} />
+                    <div style={{ width: 60, height: 10, borderRadius: 2, background: getCssGradient(p.id), border: '1px solid #333', flexShrink: 0 }} />
                     <span style={{ fontSize: 10, color: active ? '#fff' : '#ccc' }}>{p.label}</span>
                   </div>
                 );
@@ -2021,11 +2138,15 @@ function OpacityHandle({ opacity, onChange }) {
       display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
       zIndex: 70, userSelect: 'none', width: 26,
     }}>
-      <span style={{ fontSize: 8, color: '#88dd88', writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>blend</span>
+      <span style={{ fontSize: 8, color: '#88dd88', width: 26, textAlign: 'center' }}>{Math.round(opacity * 100)}%</span>
       <input type="range" min={0} max={1} step={0.05} value={opacity}
         onChange={e => onChange(+e.target.value)}
-        style={{ writingMode: 'vertical-lr', direction: 'rtl', width: 12, height: 60, accentColor: '#88dd88', cursor: 'pointer' }} />
-      <span style={{ fontSize: 8, color: '#88dd88', width: 26, textAlign: 'center', display: 'block' }}>{Math.round(opacity * 100)}%</span>
+        style={{
+          writingMode: 'vertical-lr',
+          transform: 'rotate(180deg)',  // 0% at bottom, 100% at top
+          width: 12, height: 60, accentColor: '#88dd88', cursor: 'pointer',
+        }} />
+      <span style={{ fontSize: 8, color: '#88dd88', writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>blend</span>
     </div>
   );
 }

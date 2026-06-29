@@ -11,7 +11,7 @@ import './App.css'
 
 const STUDY_UID  = '1.3.12.2.1107.5.1.4.60070.30000026012804495395400000013'
 const DEF_CT_WL  = { wc: 40,   ww: 400   }
-const DEF_PET_WL = { wc: 5000, ww: 10000 }
+const DEF_PET_WL = { wc: 25000, ww: 50000 }
 const DEF_SUV    = { min: 0,   max: 10   }
 
 // ─── Tool definitions (2 rows × 9 cols = 18 tools) ───────────────────────────
@@ -919,8 +919,8 @@ function Ribbon({
       <RibbonCard label="W / L · SUV" color="#77aa66">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 230 }}>
           {[
-            { label:'CT',  color:'#2255aa', wl:ctWL,  setWL:setCTWL,  min:-1000,max:2000, wwMax:4000 },
-            { label:'PET', color:'#226622', wl:petWL, setWL:setPETWL, min:0,    max:15000,wwMax:30000 },
+            { label:'CT',  color:'#2255aa', wl:ctWL,  setWL:setCTWL,  min:-1000,max:2000,  wwMax:4000  },
+            { label:'PET', color:'#226622', wl:petWL, setWL:setPETWL, min:0,    max:50000, wwMax:100000 },
             { label:'SUV', color:'#886600', isSuv:true },
           ].map(r => (
             <div key={r.label} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -941,12 +941,12 @@ function Ribbon({
                 <input type="range" min={1} max={r.wwMax} value={r.wl.ww}
                   onChange={e => r.setWL(p => ({ ...p, ww: +e.target.value }))}
                   style={{ width: 60, accentColor: r.color }} />
-                <span style={{ fontSize: 8, color: r.color, minWidth: 32 }}>{r.wl.ww}</span>
+                <span style={{ fontSize: 8, color: r.color, minWidth: 32 }}>{r.wl.ww >= 1000 ? (r.wl.ww/1000).toFixed(0)+'K' : r.wl.ww}</span>
                 <span style={{ fontSize: 7, color: '#888', minWidth: 16 }}>WC</span>
                 <input type="range" min={r.min} max={r.max} value={r.wl.wc}
                   onChange={e => r.setWL(p => ({ ...p, wc: +e.target.value }))}
                   style={{ width: 60, accentColor: r.color }} />
-                <span style={{ fontSize: 8, color: r.color, minWidth: 32 }}>{r.wl.wc}</span>
+                <span style={{ fontSize: 8, color: r.color, minWidth: 32 }}>{r.wl.wc >= 1000 ? (r.wl.wc/1000).toFixed(0)+'K' : r.wl.wc}</span>
               </>}
             </div>
           ))}
@@ -1238,7 +1238,7 @@ function StatusBar({ ctWL, petWL, suv, sync, activeTool }) {
       <span>W{ctWL.ww}/L{ctWL.wc}</span>
       <span style={{ color: '#ccc' }}>·</span>
       <span style={{ color: '#226622', fontWeight: 'bold' }}>PET</span>
-      <span>W{petWL.ww}/L{petWL.wc}</span>
+      <span>W{petWL.ww >= 1000 ? (petWL.ww/1000).toFixed(0)+'K' : petWL.ww}/L{petWL.wc >= 1000 ? (petWL.wc/1000).toFixed(0)+'K' : petWL.wc}</span>
       <span style={{ color: '#ccc' }}>·</span>
       <span style={{ color: '#886600', fontWeight: 'bold' }}>SUV</span>
       <span>{suv.min.toFixed(1)}–{suv.max.toFixed(1)}</span>
@@ -1263,6 +1263,7 @@ export default function App() {
   const [petWL,           setPETWL]           = useState(DEF_PET_WL)
   const [suv,             setSUV]             = useState(DEF_SUV)
   const [petOpacity,      setPetOpacity]      = useState(0.5)
+  const [petPaletteId,    setPetPaletteId]    = useState('inv_hot_iron')
   const [activeTool,      setActiveTool]      = useState(null)
   const [sync,            setSync]            = useState({ scroll: true, zoom: false, pan: false })
   const [expandedId,      setExpandedId]      = useState(null)
@@ -1409,6 +1410,7 @@ export default function App() {
                 onCTWL={setCTWL}     onPETWL={setPETWL}
                 suvThreshold={suv}   onSUV={setSUV}
                 petOpacity={petOpacity} onOpacity={setPetOpacity}
+                petPaletteId={petPaletteId} onPetPaletteChange={setPetPaletteId}
                 activeToolCT={activeTool}
                 activeToolPET={activeTool}
                 expandedId={expandedId} onExpand={setExpandedId}

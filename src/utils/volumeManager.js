@@ -30,6 +30,7 @@ import {
   getRenderingEngine,
   cache,
   imageLoader,
+  eventTarget,
   Enums as CoreEnums,
   utilities as csUtilities,
 } from '@cornerstonejs/core';
@@ -150,7 +151,7 @@ function _buildPetOpacityPoints(petWL, globalOpacity) {
   const lower = petWL.wc - petWL.ww / 2;
   const upper = petWL.wc + petWL.ww / 2;
   const range = upper - lower;
-  if (range <= 0) return [[0, 0], [10000, blend]];
+  if (range <= 0) return [[0, 0], [50000, blend]];
   return [
     [lower,                0          ],
     [lower + range * 0.05, 0          ],
@@ -159,28 +160,27 @@ function _buildPetOpacityPoints(petWL, globalOpacity) {
   ];
 }
 
-// Apply colormap and VOI directly to a VTK actor, bypassing CS3D setProperties.
-// CS3D setProperties stores colormap in viewport.viewportProperties (shared object).
-// When called twice with different volumeIds, the second call overwrites the first.
-// Direct VTK actor manipulation is per-actor and not shared.
+// Apply colormap directly on the VTK CTF object.
+// applyColorMap() does not exist in the VTK version bundled with CS3D v2.1.16.
+// We use removeAllPoints() + addRGBPoint() but call this ONLY between renders,
+// never during an active render cycle, so uniform locations stay valid.
 function _applyActorColormap(actor, paletteId, lower, upper) {
   try {
     const prop = actor.getProperty();
     const cfun = prop.getRGBTransferFunction(0);
-    // Apply our colormap by building nodes directly on the existing cfun.
-    // This avoids creating a new cfun object (which would lose VTK internal state).
     cfun.removeAllPoints();
     for (let i = 0; i < 256; i++) {
-      const t = i / 255;
+      const t      = i / 255;
       const scalar = lower + t * (upper - lower);
       const [r, g, b] = getColor(paletteId, t);
       cfun.addRGBPoint(scalar, r / 255, g / 255, b / 255);
     }
     cfun.setMappingRange(lower, upper);
     cfun.modified();
+    prop.modified();
     console.log(`[volumeManager] Applied colormap '${paletteId}' range [${lower.toFixed(0)}, ${upper.toFixed(0)}]`);
   } catch(e) {
-    console.warn('[volumeManager] _applyActorColormap failed:', e?.message);
+    console.error('[volumeManager] _applyActorColormap FAILED:', e?.message, e);
   }
 }
 
@@ -192,6 +192,7 @@ function _applyActorOpacity(actor, opacityPoints) {
     opacityPoints.forEach(([value, opacity]) => ofun.addPoint(value, opacity));
     ofun.modified();
     prop.setScalarOpacityUnitDistance(0, 1.0);
+    prop.modified();
     console.log('[volumeManager] Applied PET opacity transfer function');
   } catch(e) {
     console.warn('[volumeManager] _applyActorOpacity failed:', e?.message);
@@ -219,72 +220,39 @@ export async function applyCTVolume(vp, { wl, colormapName }) {
 }
 
 // ─── PET-CT FUSION viewport ────────────────────────────────────────────────────
-export async function applyFusionVolumes(vp, { ctWL, petWL, petColormapName, petOpacity }) {
-  await vp.setVolumes([
-    { volumeId: CT_VOLUME_ID },
-    { volumeId: PET_VOLUME_ID },
-  ]);
+// CT ONLY — one volume per viewport. PET overlay is Canvas2D (canvasFusion.js).
+// Two-volume VTK compositing causes uncontrollable opacity/blend behaviour on
+// Intel UHD 620 and cannot be fixed without forking VTK internals.
+export async function applyFusionVolumes(vp, { ctWL }) {
+  await vp.setVolumes([{ volumeId: CT_VOLUME_ID }]);
   vp.resetCamera();
-
-  // Set VOI range via CS3D for both volumes (safe — voiRange doesn't use shared colormap)
-  try { vp.setProperties({ voiRange: voiFromWL(ctWL) }, CT_VOLUME_ID); } catch(e) {}
-  try { vp.setProperties({ voiRange: voiFromWL(petWL) }, PET_VOLUME_ID); } catch(e) {}
-
-  // Apply colormap and opacity DIRECTLY on VTK actors to avoid shared viewportProperties.
-  const ctLower  = ctWL.wc  - ctWL.ww  / 2;
-  const ctUpper  = ctWL.wc  + ctWL.ww  / 2;
-  const petLower = petWL.wc - petWL.ww / 2;
-  const petUpper = petWL.wc + petWL.ww / 2;
-
-  // Extract palette id from name like 'petct_hot_iron' -> 'hot_iron'
-  const petPaletteId = petColormapName.replace('petct_', '');
-
-  const ctActor  = _getActor(vp, CT_VOLUME_ID);
-  const petActor = _getActor(vp, PET_VOLUME_ID);
-
-  if (ctActor) {
-    _applyActorColormap(ctActor, 'gray', ctLower, ctUpper);
-    // CT is fully opaque — default VTK opacity is 1.0, no change needed
-  } else {
-    console.warn('[volumeManager] CT actor not found');
+  const ctLower = ctWL.wc - ctWL.ww / 2;
+  const ctUpper = ctWL.wc + ctWL.ww / 2;
+  // Single volume — setProperties is safe (no shared state problem)
+  try {
+    vp.setProperties({ voiRange: voiFromWL(ctWL), colormap: { name: 'gray' } });
+  } catch(e) {
+    vp.setProperties({ voiRange: voiFromWL(ctWL) });
   }
-
-  if (petActor) {
-    _applyActorColormap(petActor, petPaletteId, petLower, petUpper);
-    _applyActorOpacity(petActor, _buildPetOpacityPoints(petWL, petOpacity));
-  } else {
-    console.warn('[volumeManager] PET actor not found');
-  }
-
   vp.render();
+  console.log('[volumeManager] applyFusionVolumes: CT-only', ctLower.toFixed(0), '–', ctUpper.toFixed(0));
 }
 
 // ─── Update PET overlay on already-rendered fusion viewport ───────────────────
+// PET is Canvas2D — just trigger a render so drawFrame picks up new petWLFusionRef.
 export function setFusionPetProperties(vp, { petWL, petColormapName, petOpacity }) {
-  const petPaletteId = petColormapName.replace('petct_', '');
-  const petLower = petWL.wc - petWL.ww / 2;
-  const petUpper = petWL.wc + petWL.ww / 2;
-  try { vp.setProperties({ voiRange: voiFromWL(petWL) }, PET_VOLUME_ID); } catch(e) {}
-  const petActor = _getActor(vp, PET_VOLUME_ID);
-  if (petActor) {
-    _applyActorColormap(petActor, petPaletteId, petLower, petUpper);
-    _applyActorOpacity(petActor, _buildPetOpacityPoints(petWL, petOpacity));
-  }
-  vp.render();
+  try { vp.render(); } catch(e) {}
 }
 
 // ─── Blend slider ─────────────────────────────────────────────────────────────
+// PET opacity is Canvas2D — drawFrame reads petOpacityRef directly.
+// Just trigger a render so IMAGE_RENDERED fires and drawFrame runs.
 export function setPetOpacity(viewportId, petOpacity, petWL) {
-  const wl = petWL || { wc: 5000, ww: 10000 };
   try {
     const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId);
     if (!vp) return;
-    const petActor = _getActor(vp, PET_VOLUME_ID);
-    if (petActor) {
-      _applyActorOpacity(petActor, _buildPetOpacityPoints(wl, petOpacity));
-    }
     vp.render();
-  } catch (e) {}
+  } catch(e) {}
 }
 
 // ─── MIP viewport ─────────────────────────────────────────────────────────────
@@ -320,8 +288,32 @@ export function getOrientationMarkers(orientation) {
 }
 
 // ─── CT VOI update for fusion viewports ──────────────────────────────────────
+// Legacy single-viewport version — safe only on CT-only viewports.
 export function setFusionCtVOI(vp, ctWL) {
   try { vp.setProperties({ voiRange: voiFromWL(ctWL) }); }
   catch(e) {}
   try { vp.render(); } catch(e) {}
 }
+
+// ─── CT W/L update for two-volume fusion viewports ───────────────────────────
+// Updates CT colormap directly on the CT actor — bypasses single-arg setProperties
+// which on a two-volume viewport targets whichever volume CS3D considers current.
+// Called from ViewerBox W/L effect when modality === 'PET'.
+export function updateFusionCtWL(vp, ctWL) {
+  try {
+    const ctLower = ctWL.wc - ctWL.ww / 2;
+    const ctUpper = ctWL.wc + ctWL.ww / 2;
+    const ctActor = _getActor(vp, CT_VOLUME_ID);
+    if (ctActor) {
+      _applyActorColormap(ctActor, 'gray', ctLower, ctUpper);
+      // Restate CT scalar opacity as fully opaque (actor manipulation can reset it)
+      const ofun = ctActor.getProperty().getScalarOpacity(0);
+      ofun.removeAllPoints();
+      ofun.addPoint(ctLower, 1.0);
+      ofun.addPoint(ctUpper, 1.0);
+      ofun.modified();
+    }
+  } catch(e) {}
+}
+
+

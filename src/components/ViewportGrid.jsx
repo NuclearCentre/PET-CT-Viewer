@@ -300,6 +300,8 @@ export default function ViewportGrid({
   layout = '2x3mip',
   boxAssignments = null,
   onBoxAssign,
+  petPaletteId = 'inv_hot_iron',
+  onPetPaletteChange,
 }) {
   const [ctImageIds,   setCTImageIds]   = useState([]);
   const [petImageIds,  setPETImageIds]  = useState([]);
@@ -528,6 +530,9 @@ export default function ViewportGrid({
               onOpacity={onOpacity}
               fusionMode={fusionMode}
               fusionOffset={fusionOffset}
+              // Palette sync: pct- boxes share petPaletteId; MIP is independent
+              paletteOverride={vpDef.modality === 'PET' ? petPaletteId : null}
+              onPaletteChange={vpDef.modality === 'PET' ? onPetPaletteChange : null}
               toolGroupId={
                 vpDef.modality === 'CT'  ? 'tg-ct'  :
                 vpDef.modality === 'PET' ? 'tg-pet' :
