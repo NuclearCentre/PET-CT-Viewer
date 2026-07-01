@@ -1,4 +1,4 @@
-// App.jsx — PET-CT Viewer
+// App.jsx - PET-CT Viewer
 // Stack: React 18 + Vite 8, Cornerstone3D v2.1.16, Orthanc v1.12.10
 // StrictMode MUST remain DISABLED in main.jsx
 
@@ -7,14 +7,15 @@ import { annotation as csAnnotation } from '@cornerstonejs/tools'
 import ViewportGrid, { LAYOUT_DEFS } from './components/ViewportGrid.jsx'
 import FusionPanel from './components/FusionPanel.jsx'
 import SeriesPanel from './components/SeriesPanel.jsx'
+import Worklist from './components/Worklist.jsx'
 import './App.css'
 
-const STUDY_UID  = '1.3.12.2.1107.5.1.4.60070.30000026012804495395400000013'
+const DEFAULT_STUDY_UID = '1.3.12.2.1107.5.1.4.60070.30000026012804495395400000013'
 const DEF_CT_WL  = { wc: 40,   ww: 400   }
 const DEF_PET_WL = { wc: 25000, ww: 50000 }
 const DEF_SUV    = { min: 0,   max: 10   }
 
-// ─── Tool definitions (2 rows × 9 cols = 18 tools) ───────────────────────────
+// --- Tool definitions (2 rows - 9 cols = 18 tools) ---------------------------
 const TOOLS = [
   // Row 1
   { id:'pan',        label:'Pan',            icon:'✥',  cs:'PanTool' },
@@ -43,13 +44,13 @@ const LAYOUT_PRESETS = [
   // id, label shown below icon, mini icon character
   { id:'2x3mip', label:'2×3+MIP', icon:'⊞' },  // 4-square grid
   { id:'1x1',    label:'1×1',     icon:'▣'  },  // single filled square
-  { id:'2x2',    label:'2×2',     icon:'⊟'  },  // 2×2 grid
-  { id:'3x3',    label:'3×3',     icon:'⊞'  },  // 3×3 (same ⊞ but label differs)
+  { id:'2x2',    label:'2×2',     icon:'⊟'  },  // 2-2 grid
+  { id:'3x3',    label:'3×3',     icon:'⊞'  },  // 3-3 (same - but label differs)
   { id:'1x3mpr', label:'MPR',     icon:'⊠'  },  // split panels
   { id:'1x2',    label:'1×2',     icon:'▭'  },  // wide rectangle = 2 side by side
 ]
 
-// Mini SVG icons drawn inline for Display Layout — each is a tiny grid diagram
+// Mini SVG icons drawn inline for Display Layout - each is a tiny grid diagram
 function LayoutIcon({ id, active }) {
   const s = active ? '#336699' : '#666'
   const bg = active ? '#ddeeff' : '#f8f8f8'
@@ -103,7 +104,7 @@ function LayoutIcon({ id, active }) {
   return icons[id] || <svg width={W} height={H}/>
 }
 
-// ─── Shared card style ────────────────────────────────────────────────────────
+// --- Shared card style --------------------------------------------------------
 const cardStyle = (color = '#cccccc') => ({
   border: `1.5px solid ${color}`,
   borderRadius: 5,
@@ -125,7 +126,7 @@ const cardBodyStyle = () => ({
   background: '#ffffff',
 })
 
-// ─── Collapsible card ─────────────────────────────────────────────────────────
+// --- Collapsible card ---------------------------------------------------------
 function Card({ title, color = '#bbbbbb', defaultOpen = true, children }) {
   const [open, setOpen] = useState(defaultOpen)
   return (
@@ -139,7 +140,7 @@ function Card({ title, color = '#bbbbbb', defaultOpen = true, children }) {
   )
 }
 
-// ─── Print Layout Card ────────────────────────────────────────────────────────
+// --- Print Layout Card --------------------------------------------------------
 function PrintLayoutCard() {
   const [hover, setHover]     = useState({ r: 0, c: 0 })
   const [selected, setSelected] = useState({ r: 4, c: 4 })
@@ -163,7 +164,7 @@ function PrintLayoutCard() {
         <span style={{ fontSize: 10 }}>Print</span>
       </div>
 
-      {/* Print layout designer — toggles 10×10 grid inline */}
+      {/* Print layout designer - toggles 10-10 grid inline */}
       <div style={{
         padding: '6px 8px', marginBottom: 3,
         background: showGrid ? '#f0f4ff' : '#f8f8f8',
@@ -183,7 +184,7 @@ function PrintLayoutCard() {
           <span style={{ fontSize: 9, color: '#888' }}>{showGrid ? '▲' : '▼'}</span>
         </div>
 
-        {/* Inline 10×10 grid picker */}
+        {/* Inline 10-10 grid picker */}
         {showGrid && (
           <div style={{ marginTop: 8 }} onClick={e => e.stopPropagation()}>
             <div style={{ fontSize: 8, color: '#888', marginBottom: 4, textAlign: 'center' }}>
@@ -246,14 +247,14 @@ function PrintLayoutCard() {
   )
 }
 
-// ─── Left Panel — telephone-index tab design ──────────────────────────────────
+// --- Left Panel - telephone-index tab design ----------------------------------
 // Each section has a coloured vertical label strip between the left edge and
 // the card content, exactly like the lettered tabs in a telephone index diary.
-function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFixed, onFusionModeChange, onFusionOffsetChange, onFixRequest, onFusionReset }) {
+function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFixed, onFusionModeChange, onFusionOffsetChange, onFixRequest, onFusionReset, studyUID, onSelectStudy, studyMeta }) {
   const [selectedCard, setSelectedCard] = useState('Current Study')
   const [avatarColor,  setAvatarColor]  = useState('#185fa5')
 
-  // Swatch palette — 6 options covering warm, cool, and neutral tones
+  // Swatch palette - 6 options covering warm, cool, and neutral tones
   const AVATAR_SWATCHES = [
     { color: '#185fa5', label: 'Blue'   },
     { color: '#0f6e56', label: 'Teal'   },
@@ -275,7 +276,7 @@ function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFix
       height: '100%', overflow: 'hidden',
     }}>
 
-      {/* ── Zone 1: User profile with colour picker ── */}
+      {/* -- Zone 1: User profile with colour picker -- */}
       <div style={{
         flexShrink: 0,
         background: zoneBg,
@@ -319,48 +320,38 @@ function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFix
         </div>
       </div>
 
-      {/* ── Zone 2: Tab-card list — scrolls vertically ── */}
+      {/* -- Zone 2: Tab-card list - scrolls vertically -- */}
       <div style={{
         flex: 1, minHeight: 0,
         overflowY: 'auto', overflowX: 'hidden',
         scrollbarWidth: 'thin', scrollbarColor: '#bbb #f0f0f0',
       }}>
 
-        {/* Current Study */}
+        {/* Current Study -- patient demographics now sticky (header prop);
+            only the series thumbnail list scrolls beneath it. */}
         <TabCard label="Current Study" color="#185fa5" maxHeight={260}
-          selected={selectedCard === 'Current Study'} onSelect={setSelectedCard}>
-          <div style={{ fontSize: 9, color: '#2255aa', fontWeight: 'bold', marginBottom: 2 }}>Alka Jagtap</div>
-          <div style={{ fontSize: 8, color: '#444', marginBottom: 1 }}>PET-CT Whole Body</div>
-          <div style={{ fontSize: 8, color: '#666', marginBottom: 1 }}>28 Jan 2026 · F · 52y</div>
-          <div style={{ fontSize: 8, color: '#888', marginBottom: 5 }}>Tata Memorial Hospital</div>
-          <div style={{
-            fontSize: 7, color: '#6699cc', padding: '2px 5px', lineHeight: 1.5,
-            background: '#eef3ff', border: '1px dashed #aabbd8', borderRadius: 3, marginBottom: 5,
-          }}>⇢ Drag <b>CT</b> → CT·Axial &nbsp;·&nbsp; ⇢ Drag <b>PET</b> → PET·Axial</div>
-          <SeriesPanel studyUID={STUDY_UID} />
+          selected={selectedCard === 'Current Study'} onSelect={setSelectedCard}
+          header={
+            <>
+              <div style={{ fontSize: 9, color: '#2255aa', fontWeight: 'bold', marginBottom: 2 }}>{studyMeta.patientName}</div>
+              <div style={{ fontSize: 8, color: '#444', marginBottom: 1 }}>{studyMeta.desc}</div>
+              <div style={{ fontSize: 8, color: '#666', marginBottom: 1 }}>{studyMeta.dateLabel}</div>
+              <div style={{ fontSize: 8, color: '#888', marginBottom: 5 }}>Tata Memorial Hospital</div>
+              <div style={{
+                fontSize: 7, color: '#6699cc', padding: '2px 5px', lineHeight: 1.5,
+                background: '#eef3ff', border: '1px dashed #aabbd8', borderRadius: 3,
+              }}>⇢ Drag <b>CT</b> → CT·Axial &nbsp;·&nbsp; ⇢ Drag <b>PET</b> → PET·Axial</div>
+            </>
+          }
+        >
+          <SeriesPanel studyUID={studyUID} />
         </TabCard>
 
-        {/* Worklist */}
-        <TabCard label="Worklist" color="#378add" maxHeight={150}
+        {/* Worklist -- real Orthanc study list + upload (replaces Session <=17's
+            static 3-row mock). See components/Worklist.jsx. */}
+        <TabCard label="Worklist" color="#378add" maxHeight={260}
           selected={selectedCard === 'Worklist'} onSelect={setSelectedCard}>
-          <div style={{ display: 'flex', gap: 3, marginBottom: 5 }}>
-            <div style={{ flex: 1, padding: '3px 5px', background: '#f8f8f8', border: '1px solid #ccc', borderRadius: 3, fontSize: 8, color: '#888' }}>🔍 Search…</div>
-            <div style={{ padding: '3px 7px', background: '#f0f4ff', border: '1px solid #99aacc', borderRadius: 3, fontSize: 10, cursor: 'pointer', color: '#336699' }}>⟳</div>
-          </div>
-          {[
-            { name: 'Alka Jagtap',  date: '28 Jan', type: 'PET-CT', active: true },
-            { name: 'Suresh Kumar', date: '27 Jan', type: 'CT',     active: false },
-            { name: 'Priya Mehta',  date: '26 Jan', type: 'PET-CT', active: false },
-          ].map((p, i) => (
-            <div key={i} style={{
-              padding: '3px 5px', marginBottom: 2, borderRadius: 3, cursor: 'pointer',
-              background: p.active ? '#dde8f8' : '#f8f8f8',
-              border: `1px solid ${p.active ? '#99aacc' : '#ddd'}`,
-            }}>
-              <div style={{ fontSize: 8, color: p.active ? '#0c447c' : '#222', fontWeight: p.active ? 'bold' : 'normal' }}>{p.name}</div>
-              <div style={{ fontSize: 7, color: p.active ? '#185fa5' : '#888' }}>{p.date} · {p.type}</div>
-            </div>
-          ))}
+          <Worklist activeStudyUID={studyUID} onSelectStudy={onSelectStudy} />
         </TabCard>
 
         {/* Display Layout */}
@@ -423,13 +414,13 @@ function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFix
           labelExtra={fusionFixed ? <span style={{ fontSize: 7, color: '#ffcc44' }}>FIXED</span> : null}
           selected={selectedCard === 'PET Fusion'} onSelect={setSelectedCard}>
 
-          {/* Mode selector — icon tiles side by side */}
+          {/* Mode selector - icon tiles side by side */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5, marginBottom: 8 }}>
             {[
               {
                 mode: 'auto',
                 label: 'Auto Fusion',
-                // Two overlapping concentric circles — auto alignment icon
+                // Two overlapping concentric circles - auto alignment icon
                 icon: (
                   <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
                     <circle cx="10" cy="14" r="7" stroke="currentColor" strokeWidth="1.8" fill="none" opacity="0.7"/>
@@ -443,7 +434,7 @@ function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFix
               {
                 mode: 'manual',
                 label: 'Manual Fusion',
-                // Hand/sliders icon — manual control
+                // Hand/sliders icon - manual control
                 icon: (
                   <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
                     {/* three horizontal slider lines */}
@@ -498,7 +489,7 @@ function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFix
         <TabCard label="Print / PDF" color="#993c1d" maxHeight={200}
           selected={selectedCard === 'Print / PDF'} onSelect={setSelectedCard}>
 
-          {/* Primary actions — icon tiles */}
+          {/* Primary actions - icon tiles */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5, marginBottom: 8 }}>
             {[
               {
@@ -592,7 +583,7 @@ function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFix
 
       </div>{/* end Zone 2 */}
 
-      {/* ── Zone 3: Quick-access icon bar + sign out — always visible ── */}
+      {/* -- Zone 3: Quick-access icon bar + sign out - always visible -- */}
       <div style={{ flexShrink: 0, borderTop: '1px solid #ccc', background: '#e8e8e8' }}>
         {/* Horizontal scrollable icon bar */}
         <div style={{
@@ -635,15 +626,15 @@ function LeftPanel({ layout, onLayoutChange, fusionMode, fusionOffset, fusionFix
   )
 }
 
-// ─── TabCard — telephone-index style card ─────────────────────────────────────
-// • No collapse. Content always visible.
-// • Click anywhere → onSelect(label) → neon border on that card.
-// • Neon uses outline (not border) so it is never clipped by parent overflow.
+// --- TabCard - telephone-index style card -------------------------------------
+// - No collapse. Content always visible.
+// - Click anywhere - onSelect(label) - neon border on that card.
+// - Neon uses outline (not border) so it is never clipped by parent overflow.
 //   outline renders outside the border-box and is unaffected by ancestor
 //   overflow:hidden/auto containers.
-// • Scrollbar stays inside: content div has paddingRight so the scrollbar
+// - Scrollbar stays inside: content div has paddingRight so the scrollbar
 //   track occupies the padding area, always inside the card frame.
-function TabCard({ label, color, children, maxHeight = 200, labelExtra, selected, onSelect }) {
+function TabCard({ label, color, children, header, maxHeight = 200, labelExtra, selected, onSelect }) {
   return (
     <div
       onMouseDown={() => onSelect?.(label)}
@@ -660,7 +651,7 @@ function TabCard({ label, color, children, maxHeight = 200, labelExtra, selected
         marginBottom: '1px',
       }}
     >
-      {/* Vertical label strip — always visible */}
+      {/* Vertical label strip - always visible */}
       <div style={{
         width: 20, minWidth: 20, flexShrink: 0,
         background: color,
@@ -687,29 +678,52 @@ function TabCard({ label, color, children, maxHeight = 200, labelExtra, selected
         {labelExtra && <div style={{ marginTop: 4 }}>{labelExtra}</div>}
       </div>
 
-      {/* Content — always fully rendered */}
+      {/* Content column: optional sticky header (e.g. patient demographics)
+          stays fixed; only the body below it scrolls. Without `header`,
+          behaves exactly as before (everything in one scrolling region). */}
       <div style={{
         flex: 1, minWidth: 0,
         maxHeight,
-        overflowY: 'auto',
-        overflowX: 'hidden',
-        // paddingRight leaves room for the scrollbar so it sits inside the outline.
-        // The thin scrollbar is ~8px; 10px padding gives 2px breathing room.
-        paddingTop: '7px',
-        paddingBottom: '7px',
-        paddingLeft: '8px',
-        paddingRight: '10px',
+        display: 'flex',
+        flexDirection: 'column',
         boxSizing: 'border-box',
-        scrollbarWidth: 'thin',
-        scrollbarColor: `${color}88 #f0f0f0`,
       }}>
-        {children}
+        {header && (
+          <div style={{
+            flexShrink: 0,
+            paddingTop: '7px',
+            paddingLeft: '8px',
+            paddingRight: '10px',
+            borderBottom: '1px solid #eee',
+            paddingBottom: '6px',
+            marginBottom: '4px',
+          }}>
+            {header}
+          </div>
+        )}
+        <div style={{
+          flex: 1,
+          minHeight: 0,
+          overflowY: 'auto',
+          overflowX: 'hidden',
+          // paddingRight leaves room for the scrollbar so it sits inside the outline.
+          // The thin scrollbar is ~8px; 10px padding gives 2px breathing room.
+          paddingTop: header ? 0 : '7px',
+          paddingBottom: '7px',
+          paddingLeft: '8px',
+          paddingRight: '10px',
+          boxSizing: 'border-box',
+          scrollbarWidth: 'thin',
+          scrollbarColor: `${color}88 #f0f0f0`,
+        }}>
+          {children}
+        </div>
       </div>
     </div>
   )
 }
 
-// ─── Shortcuts Modal ─────────────────────────────────────────────────────────
+// --- Shortcuts Modal ---------------------------------------------------------
 function ShortcutsModal({ onClose }) {
   const SECTIONS = [
     {
@@ -844,7 +858,7 @@ function ShortcutsModal({ onClose }) {
   )
 }
 
-// ─── Ribbon ───────────────────────────────────────────────────────────────────
+// --- Ribbon -------------------------------------------------------------------
 function RibbonCard({ label, children, color = '#444444' }) {
   return (
     <div style={{
@@ -853,7 +867,7 @@ function RibbonCard({ label, children, color = '#444444' }) {
       borderRadius: 4, background: '#ffffff',
       minWidth: 'fit-content', flexShrink: 0,
     }}>
-      {/* Black header — full width, white text */}
+      {/* Black header - full width, white text */}
       <div style={{
         background: '#1a1a1a', color: '#ffffff',
         fontSize: 9, fontWeight: 'bold',
@@ -887,6 +901,7 @@ function Ribbon({
   activeTool, onToolChange, sync, onSync,
   ctWL, setCTWL, petWL, setPETWL, suv, setSUV,
   petOpacity, setPetOpacity, onResetAll, onClearROI, onShortcuts,
+  stackMode, onStackMode,
 }) {
   return (
     <div style={{
@@ -895,7 +910,7 @@ function Ribbon({
       minHeight: 100, flexShrink: 0, overflowX: 'auto', overflowY: 'visible',
       padding: '2px 4px', boxSizing: 'border-box',
     }}>
-      {/* Tools card — 9 cols × 2 rows */}
+      {/* Tools card - 9 cols - 2 rows */}
       <RibbonCard label="Tools" color="#6699bb">
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(9,1fr)', gap: 3 }}>
           {TOOLS.map(t => (
@@ -988,19 +1003,9 @@ function Ribbon({
         </div>
       </RibbonCard>
 
-      {/* Cine card */}
-      <RibbonCard label="Cine" color="#aa8855">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <div style={{ fontSize: 8, color: '#664422', lineHeight: 1.5 }}>
-            Slice fps &amp; MIP rpm<br/>
-            <span style={{ color: '#888' }}>controlled per-viewport<br/>via cine bar below each image</span>
-          </div>
-        </div>
-      </RibbonCard>
-
-      {/* System card */}
+      {/* System card -- 2x2 grid: row1 = Shortcuts+Settings, row2 = Help+S/V */}
       <RibbonCard label="System" color="#8866aa">
-        <div style={{ display: 'flex', gap: 4 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 3 }}>
           {[
             { icon: '⌨', title: 'Keyboard Shortcuts', onClick: onShortcuts },
             { icon: '⚙', title: 'Settings',           onClick: null },
@@ -1008,7 +1013,7 @@ function Ribbon({
           ].map(({ icon, title, onClick }) => (
             <button key={title} title={title} onClick={onClick}
               style={{
-                width: 38, height: 38, fontSize: 22, cursor: 'pointer',
+                width: 36, height: 28, fontSize: 18, cursor: 'pointer',
                 borderRadius: 4, border: '1px solid #ddd',
                 background: '#f8f8f8', color: '#444',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1017,13 +1022,26 @@ function Ribbon({
               onMouseLeave={e => e.currentTarget.style.background = '#f8f8f8'}
             >{icon}</button>
           ))}
+          {/* Stack / Volume mode toggle -- occupies the 4th cell */}
+          <button
+            title={stackMode ? 'Switch to Volume mode (GPU MPR)' : 'Switch to Stack mode (CPU 2D)'}
+            onClick={() => onStackMode?.(!stackMode)}
+            style={{
+              width: 36, height: 28, fontSize: 9, fontWeight: 'bold',
+              cursor: 'pointer', borderRadius: 4,
+              border: '1.5px solid ' + (stackMode ? '#cc8800' : '#7766aa'),
+              background: stackMode ? '#fff8e0' : '#f0eeff',
+              color: stackMode ? '#885500' : '#4433aa',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >{stackMode ? 'Stack' : 'Vol'}</button>
         </div>
       </RibbonCard>
     </div>
   )
 }
 
-// ─── Patient Banner ───────────────────────────────────────────────────────────
+// --- Patient Banner -----------------------------------------------------------
 function PatientBanner() {
   return (
     <div style={{
@@ -1044,7 +1062,7 @@ function PatientBanner() {
   )
 }
 
-// ─── Right Panel ──────────────────────────────────────────────────────────────
+// --- Right Panel --------------------------------------------------------------
 // Same telephone-index tab design as the left panel.
 // When collapsed: only the coloured tab strips are visible (20px wide each),
 // giving a visual cue of what's inside without taking space.
@@ -1071,7 +1089,7 @@ function RightPanel({ collapsed, onToggle }) {
       transition: 'width 0.15s ease',
       overflow: 'hidden', position: 'relative',
     }}>
-      {/* Collapse/expand toggle — always visible at top */}
+      {/* Collapse/expand toggle - always visible at top */}
       <div style={{
         flexShrink: 0,
         display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1113,7 +1131,7 @@ function RightPanel({ collapsed, onToggle }) {
           flex: 1, minHeight: 0,
           display: 'flex', flexDirection: 'column', overflow: 'hidden',
         }}>
-          {/* Doctor info strip — mirrors left panel */}
+          {/* Doctor info strip - mirrors left panel */}
           <div style={{
             flexShrink: 0,
             background: avatarColor + '18',
@@ -1225,7 +1243,7 @@ function RightPanel({ collapsed, onToggle }) {
   )
 }
 
-// ─── Status Bar ───────────────────────────────────────────────────────────────
+// --- Status Bar ---------------------------------------------------------------
 function StatusBar({ ctWL, petWL, suv, sync, activeTool }) {
   const tool = TOOLS.find(t => t.id === activeTool)
   return (
@@ -1255,15 +1273,20 @@ function StatusBar({ ctWL, petWL, suv, sync, activeTool }) {
   )
 }
 
-// ─── Root App ─────────────────────────────────────────────────────────────────
+// --- Root App -----------------------------------------------------------------
 export default function App() {
+  const [studyUID,         setStudyUID]        = useState(DEFAULT_STUDY_UID)
+  const [stackMode,        setStackMode]       = useState(false)
+  const [studyMeta,        setStudyMeta]        = useState({
+    patientName: 'Alka Jagtap', desc: 'PET-CT Whole Body', dateLabel: '28 Jan 2026 · F · 52y',
+  })
   const [layout,          setLayout]          = useState('2x3mip')
   const [boxAssignments,  setBoxAssignments]  = useState(null)
   const [ctWL,            setCTWL]            = useState(DEF_CT_WL)
   const [petWL,           setPETWL]           = useState(DEF_PET_WL)
   const [suv,             setSUV]             = useState(DEF_SUV)
   const [petOpacity,      setPetOpacity]      = useState(0.5)
-  const [petPaletteId,    setPetPaletteId]    = useState('inv_hot_iron')
+  const [petPaletteId,    setPetPaletteId]    = useState('hot_iron')
   const [activeTool,      setActiveTool]      = useState(null)
   const [sync,            setSync]            = useState({ scroll: true, zoom: false, pan: false })
   const [expandedId,      setExpandedId]      = useState(null)
@@ -1309,6 +1332,21 @@ export default function App() {
       })
     } catch(e) {}
   }, [])
+
+  // Switching studies from the Worklist: CS3D's annotation store is global,
+  // not scoped per study, so ROIs drawn on the previous study would otherwise
+  // linger and render in nonsensical positions against the new volumes.
+  const selectStudy = useCallback((uid, meta) => {
+    clearROI()
+    setStudyUID(uid)
+    if (meta) {
+      setStudyMeta({
+        patientName: meta.patientName || 'Unknown',
+        desc:        meta.desc || meta.modalities || '',
+        dateLabel:   `${meta.dateLabel || '—'}${meta.modalities ? ' · ' + meta.modalities : ''}`,
+      })
+    }
+  }, [clearROI])
 
   return (
     <div style={{
@@ -1370,7 +1408,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Left panel — full height from top */}
+      {/* Left panel - full height from top */}
       <LeftPanel
         layout={layout} onLayoutChange={handleLayoutChange}
         fusionMode={fusionMode}
@@ -1380,12 +1418,15 @@ export default function App() {
         onFusionOffsetChange={setFusionOffset}
         onFixRequest={() => setShowFixModal(true)}
         onFusionReset={onFusionReset}
+        studyUID={studyUID}
+        onSelectStudy={selectStudy}
+        studyMeta={studyMeta}
       />
 
-      {/* Centre + right — column */}
+      {/* Centre + right - column */}
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
 
-        {/* Ribbon — spans centre + right */}
+        {/* Ribbon - spans centre + right */}
         <Ribbon
           activeTool={activeTool} onToolChange={setActiveTool}
           sync={sync} onSync={onSync}
@@ -1395,6 +1436,7 @@ export default function App() {
           petOpacity={petOpacity} setPetOpacity={setPetOpacity}
           onResetAll={resetAll} onClearROI={clearROI}
           onShortcuts={() => setShowShortcuts(true)}
+                stackMode={stackMode}  onStackMode={setStackMode}
         />
 
         {/* Patient banner + viewports + right panel */}
@@ -1405,9 +1447,9 @@ export default function App() {
             <PatientBanner />
             <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
               <ViewportGrid
-                studyUID={STUDY_UID}
+                studyUID={studyUID}
                 ctWL={ctWL}          petWL={petWL}
-                onCTWL={setCTWL}     onPETWL={setPETWL}
+                onCTWL={(wc, ww) => setCTWL({ wc, ww })}     onPETWL={(wc, ww) => setPETWL({ wc, ww })}
                 suvThreshold={suv}   onSUV={setSUV}
                 petOpacity={petOpacity} onOpacity={setPetOpacity}
                 petPaletteId={petPaletteId} onPetPaletteChange={setPetPaletteId}
@@ -1428,7 +1470,7 @@ export default function App() {
             <StatusBar ctWL={ctWL} petWL={petWL} suv={suv} sync={sync} activeTool={activeTool} />
           </div>
 
-          {/* Right panel — full height from ribbon */}
+          {/* Right panel - full height from ribbon */}
           <RightPanel collapsed={rightCollapsed} onToggle={() => setRightCollapsed(v => !v)} />
         </div>
       </div>

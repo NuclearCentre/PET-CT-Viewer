@@ -121,7 +121,7 @@ export async function initCornerstone() {
         lineWidth:               '1.5',
         lineDash:                '',
         shadow:                  true,
-        textBoxVisibility:       false,
+        textBoxVisibility:       true,
         textBoxFontFamily:       'monospace',
         textBoxFontSize:         '12px',
         textBoxColor:            'rgb(255, 222, 0)',
@@ -250,13 +250,22 @@ function _createMPRToolGroup(groupId) {
   tg.setToolActive(PanTool.toolName,         { bindings: [{ mouseButton: MouseBindings.Primary }] });
   tg.setToolActive(ZoomTool.toolName,        { bindings: [{ mouseButton: MouseBindings.Secondary }] });
   tg.setToolActive(StackScrollTool.toolName, { bindings: [{ mouseButton: MouseBindings.Wheel }] });
-  tg.setToolActive(WindowLevelTool.toolName, { bindings: [{ mouseButton: MouseBindings.Auxiliary }] });
+  // WindowLevel is intentionally NOT bound to Auxiliary here anymore -- that
+  // button now belongs to Crosshairs (see below) so cross-plane navigation
+  // works by default without a toolbar click. W/L is still fully available
+  // via the toolbar 'wl' tool, which binds WindowLevel to plain Primary when
+  // selected (see the toolbar-tool-override effect in ViewerBox.jsx).
+  tg.setToolPassive(WindowLevelTool.toolName);
 
-  // Crosshairs: reference lines coloured per row. Kept DISABLED by default -
+  // Crosshairs: reference lines coloured per row. Kept DISABLED at creation -
   // a Passive/Enabled crosshairs runs mouseMoveCallback on every move and throws
   // ("cannot read 'length' of undefined") until its annotation is initialised,
   // which only happens reliably in the ACTIVE mode AFTER volumes are loaded.
-  // The toolbar "Crosshair" button activates it on demand (see setCrosshairsActive).
+  // ViewportGrid.jsx calls setCrosshairsActive(true) once volumes finish
+  // loading, so it's effectively ON BY DEFAULT (bound to Auxiliary / middle-
+  // click) without requiring the user to press the toolbar "Crosshair" button
+  // first -- that button now just lets them turn it off again if they want
+  // the old WindowLevel-on-middle-click behaviour back.
   tg.addTool(CrosshairsTool.toolName, {
     getReferenceLineColor: (viewportId) => REFERENCE_LINE_COLORS[viewportId] || 'rgb(200,200,200)',
     getReferenceLineControllable: () => true,
@@ -296,20 +305,25 @@ function _createMPRToolGroup(groupId) {
   return tg;
 }
 
-// Toggle crosshairs between ACTIVE (click-to-navigate + visible reference lines)
-// and DISABLED (off - no event handling, so no mouseMoveCallback crash). We use
-// DISABLED rather than PASSIVE for the "off" state because PASSIVE still runs the
-// crashing mouseMoveCallback. Used by the toolbar "Crosshair" button.
+// Toggle crosshairs between ACTIVE (middle-click-to-navigate + visible
+// reference lines) and DISABLED (off - no event handling, so no
+// mouseMoveCallback crash). We use DISABLED rather than PASSIVE for the "off"
+// state because PASSIVE still runs the crashing mouseMoveCallback. Bound to
+// Auxiliary (middle-click), not Primary, so it never competes with Pan or any
+// ROI/annotation tool's plain-Primary or Shift/Ctrl-modified bindings -- it
+// can simply stay active by default. Called once from ViewportGrid.jsx after
+// volumes finish loading, and (still) from the toolbar "Crosshair" button if
+// the user wants to switch back to WindowLevel-on-middle-click.
 export function setCrosshairsActive(active) {
   try {
     const tg = ToolGroupManager.getToolGroup(TOOL_GROUP_MPR);
     if (!tg) return;
     if (active) {
-      tg.setToolActive(CrosshairsTool.toolName, { bindings: [{ mouseButton: MouseBindings.Primary }] });
-      tg.setToolPassive(PanTool.toolName);
+      tg.setToolActive(CrosshairsTool.toolName, { bindings: [{ mouseButton: MouseBindings.Auxiliary }] });
+      tg.setToolPassive(WindowLevelTool.toolName);
     } else {
       tg.setToolDisabled(CrosshairsTool.toolName);
-      tg.setToolActive(PanTool.toolName, { bindings: [{ mouseButton: MouseBindings.Primary }] });
+      tg.setToolActive(WindowLevelTool.toolName, { bindings: [{ mouseButton: MouseBindings.Auxiliary }] });
     }
   } catch(e) {}
 }

@@ -55,18 +55,58 @@ import {
   setFusionPetProperties,
   setFusionCtVOI,
   updateFusionCtWL,
+  setMIPColormap,
   setPetOpacity,
   getOrientationMarkers,
 } from '../utils/volumeManager.js';
 import { applyFusionTransform, resetFusionTransform } from '../utils/fusionManager.js';
 import { renderPETOverlay, getPETPlaneWorldSpace, buildLUT } from '../utils/canvasFusion.js';
+import { roiStatsFromAnnotation, suvAvailable, suvUncalibratedReason } from '../utils/suvUtils.js';
 
 // triggerAnnotationRenderForViewportIds polyfill for CS3D v2.1.16
-function triggerAnnotationRenderForViewportIds(viewportIds) {
+//
+// Rule 32 guard: VTK resets cam.position + cam.parallelScale on EVERY
+// render() call on an ORTHOGRAPHIC viewport. This helper is called from many
+// places (SUV-stats retry loop after every ROI completes, up to 8x over 4s;
+// W/L updates; palette changes; etc.), so without an explicit snapshot/
+// restore here, each of those render() calls is a chance for the viewport's
+// zoom/pan to silently drift -- visible as the image "jumping" after drawing
+// a ROI. STACK viewports (non-volume) don't have this VTK quirk and don't
+// need the guard, so it's skipped for those.
+// triggerAnnotationRenderForViewportIds -- Rule 32 guard.
+// camOverrides: optional { viewportId -> camera } to force-set after render()
+// instead of restoring the pre-render snapshot. Used by cross-plane navigation
+// so sibling viewports stay at the navigated slice position.
+function triggerAnnotationRenderForViewportIds(viewportIds, camOverrides) {
   if (!viewportIds || !viewportIds.length) return;
   viewportIds.forEach((vid) => {
     const ee = getEnabledElementByViewportId(vid);
-    if (ee && ee.viewport) { ee.viewport.render(); }
+    if (!ee || !ee.viewport) return;
+    const vp = ee.viewport;
+    const override = camOverrides?.[vid] || null;
+    let cam = null;
+    if (!override) {
+      try { cam = typeof vp.getCamera === 'function' ? vp.getCamera() : null; } catch(e) {}
+    }
+    vp.render();
+    const restoreCam = override || cam;
+    if (restoreCam?.position && restoreCam?.focalPoint && restoreCam?.parallelScale != null) {
+      // VTK's ORTHOGRAPHIC camera reset runs in a deferred microtask after
+      // render() returns. A synchronous setCamera() here runs BEFORE the reset
+      // and gets overwritten. setTimeout(0) pushes our restore after VTK's
+      // reset, so it wins. Two nested rAFs ensure we are past the reset.
+      const restore = () => {
+        try {
+          vp.setCamera({
+            position:      restoreCam.position,
+            focalPoint:    restoreCam.focalPoint,
+            viewUp:        restoreCam.viewUp,
+            parallelScale: restoreCam.parallelScale,
+          });
+        } catch(e) {}
+      };
+      requestAnimationFrame(() => requestAnimationFrame(restore));
+    }
   });
 }
 
@@ -75,7 +115,7 @@ const { MouseBindings, KeyboardBindings } = ToolEnums;
 
 // Session 14: MIP uses inv_greyscale (inverse greyscale) -- user request.
 // PET fusion overlays use inv_hot_iron colourmap blended over CT greyscale base.
-const DEFAULT_COLORMAP = { CT: 'gray', PET: 'inv_hot_iron', MIP: 'inv_greyscale' }
+const DEFAULT_COLORMAP = { CT: 'gray', PET: 'hot_iron', MIP: 'inv_greyscale' }
 
 // MIP renders on a BLACK clear colour, then App.css inverts the whole canvas
 // (filter: invert(1)) -> black background becomes white, bright uptake becomes
@@ -127,6 +167,7 @@ export default function ViewerBox({
   label = 'CT . Axial',
   accentColor = '#88c4ff',
   imageIds = [],
+  volumeKey = 0,
   toolGroupId,
   wl = { wc: 40, ww: 400 },
   onWL,
@@ -151,6 +192,10 @@ export default function ViewerBox({
   // Palette sync: parent can override local palette (for pct- sync)
   paletteOverride = null,
   onPaletteChange = null,
+  // Drag-and-drop series loading (from SeriesPanel) -- only set for ct-axial
+  // and pct-axial by ViewportGrid.jsx; coronal/sagittal never receive these.
+  onSeriesDrop = null,
+  dropStudyUID = null,
 }) {
   const divRef      = useRef(null);
   const hasVP          = useRef(false);
@@ -165,6 +210,21 @@ export default function ViewerBox({
   const petWLFusionRef   = useRef({ wc: 25000, ww: 50000 });
   const orientationRef   = useRef(orientation);  // avoids stale closure in drawFrame
   const glFramePending = useRef(false);  // rAF dedup
+  // MIP colour filter, applied continuously on every IMAGE_RENDERED (see
+  // MIP LOCKED RULE (resolved, do not change without being explicitly
+  // asked): white background + TRUE palette colour for every palette,
+  // including gray. Filter is always 'invert(1)' -- the actor's own colours
+  // are pre-inverted (see setMIPColormap / _applyActorColormap's
+  // preInvertForWhiteBg) so the mandatory invert cancels back out to the
+  // real colour, while black (background / low uptake) still flips to
+  // white. Reapplied continuously on every IMAGE_RENDERED (see
+  // _setMIPCanvasBg below), not just once after a palette change --  MIP's
+  // continuous rotation loop calls render() every frame, and each one is a
+  // fresh chance for CS3D to recreate the canvas node and drop the inline
+  // style. A ref (not a plain closure variable) because this effect's deps
+  // don't include the palette, so a closure would go stale the moment the
+  // palette changes.
+  const mipFilterRef = useRef('invert(1)');
 
   const [paletteId, setPaletteId]     = useState(DEFAULT_COLORMAP[modality] || 'gray');
   // If parent supplies paletteOverride (for pct- sync), use it
@@ -173,6 +233,7 @@ export default function ViewerBox({
   const [showPresets, setShowPresets] = useState(false);
   const [sliceInfo, setSliceInfo]     = useState({ current: 0, total: 0 });
   const [mipPlaying, setMipPlaying]   = useState(false);  // lifted so orientation bar can stop rotation
+  const [seriesDragOver, setSeriesDragOver] = useState(false); // drop-target highlight for drag-and-drop series loading
   const closeTimers = useRef({});
 
   const isVolume = renderMode === 'volume';
@@ -209,15 +270,23 @@ export default function ViewerBox({
       if (!engine || cancelled) return;
       const el = divRef.current;
 
-      engine.enableElement({
-        viewportId,
-        type: isVolume ? ViewportType.ORTHOGRAPHIC : ViewportType.STACK,
-        element: el,
-        defaultOptions: {
-          background: VP_BACKGROUND[modality] || [0,0,0],
-          ...(isVolume ? { orientation: ORIENTATION[orientation] || OrientationAxis.AXIAL } : {}),
-        },
-      });
+      // Check if this is a re-run after a series swap (volumeKey bump).
+      // In that case the element is already enabled -- calling enableElement
+      // again causes a shader-compile crash (CONTEXT_LOST_WEBGL) on Intel UHD.
+      // Instead, just re-apply volumes to re-wire the VTK actor to the new
+      // volume cache that ensureVolumes() just created.
+      const alreadyEnabled = !!engine.getViewport(viewportId);
+      if (!alreadyEnabled) {
+        engine.enableElement({
+          viewportId,
+          type: isVolume ? ViewportType.ORTHOGRAPHIC : ViewportType.STACK,
+          element: el,
+          defaultOptions: {
+            background: VP_BACKGROUND[modality] || [0,0,0],
+            ...(isVolume ? { orientation: ORIENTATION[orientation] || OrientationAxis.AXIAL } : {}),
+          },
+        });
+      }
 
       // div.viewport-element already has overflow:hidden (CS3D sets it in
       // getOrCreateCanvas.js). The SVG is inside it. Belt-and-suspenders:
@@ -240,7 +309,19 @@ export default function ViewerBox({
         const _setMIPCanvasBg = () => {
           try {
             const webglCanvas = el.querySelector('canvas');
-            if (webglCanvas) webglCanvas.style.background = '#ffffff';
+            if (webglCanvas) {
+              webglCanvas.style.background = '#ffffff';
+              // MIP LOCKED RULE: filter is always invert(1) (mipFilterRef is
+              // now constant) -- reapplied on every single render because
+              // MIP's continuous rotation loop calls render() every frame,
+              // and each one is a fresh chance for CS3D to recreate the
+              // canvas node and drop the inline style. !important because
+              // App.css's own rule uses !important too (confirmed via
+              // runtime diagnostic: a plain assignment set the inline style
+              // correctly but lost to the stylesheet's computed value
+              // regardless) -- setProperty(..., 'important') wins over that.
+              webglCanvas.style.setProperty('filter', mipFilterRef.current, 'important');
+            }
             el.style.background = '#ffffff';
           } catch(e) {}
         };
@@ -250,7 +331,7 @@ export default function ViewerBox({
       const vp = engine.getViewport(viewportId);
       if (!vp || cancelled) return;
 
-      if (toolGroupId) {
+      if (toolGroupId && !alreadyEnabled) {
         const tg = ToolGroupManager.getToolGroup(toolGroupId);
         if (tg) tg.addViewport(viewportId, RENDERING_ENGINE_ID);
       }
@@ -345,7 +426,7 @@ export default function ViewerBox({
       } catch(e) {}
       hasVP.current = false;
     };
-  }, [viewportId, imageIds, toolGroupId, renderMode, orientation, volumesReady]);
+  }, [viewportId, imageIds, toolGroupId, renderMode, orientation, volumesReady, volumeKey]);
 
   // -- Canvas2D fusion overlay -----------------------------------------------
   useEffect(() => {
@@ -359,6 +440,8 @@ export default function ViewerBox({
     function drawFrame() {
       glFramePending.current = false;
       try {
+        // Raw blend from slider - renderPETOverlay applies 30% floor so PET
+        // is always visible even at slider 0%
         const blend = Math.max(0, Math.min(1, petOpacityRef.current));
         const el    = divRef.current;
         if (!canvas || !el) return;
@@ -371,11 +454,7 @@ export default function ViewerBox({
           canvas.height = ch;
         }
 
-        if (blend < 0.004) {
-          const ctx = canvas.getContext('2d');
-          if (ctx) ctx.clearRect(0, 0, cw, ch);
-          return;
-        }
+        // No early exit at blend=0 - renderPETOverlay ensures 30% minimum
 
         const engine = getRenderingEngine(RENDERING_ENGINE_ID);
         const pctVp  = engine?.getViewport(viewportId);
@@ -411,10 +490,20 @@ export default function ViewerBox({
           }
         } catch(e) {}
 
+        // petLo/petHi now driven by the actual PET W/L window (wc-ww/2),
+        // not a hardcoded 0..auto-percentile range -- this is what the
+        // colour-strip's two compression cursors actually control. Falls
+        // back to the auto-computed petHi only if W/L isn't available yet
+        // (e.g. very first frame before petWLFusionRef has a real value).
+        const _wl = petWLFusionRef.current;
+        const _hasWL = _wl && Number.isFinite(_wl.wc) && Number.isFinite(_wl.ww);
+        const _petLo = _hasWL ? Math.max(0, _wl.wc - _wl.ww / 2) : 0;
+        const _petHi = _hasWL ? Math.max(_petLo + 1, _wl.wc + _wl.ww / 2) : petPlane.petHi;
+
         renderPETOverlay(canvas, petPlane.data, petPlane.width, petPlane.height, lut, {
           alpha:        blend,
-          petLo:        0,
-          petHi:        petPlane.petHi,
+          petLo:        _petLo,
+          petHi:        _petHi,
           power:        2.0,
           vpBounds,
           petImageData: petPlane.petImageData,
@@ -497,6 +586,39 @@ export default function ViewerBox({
     try { getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)?.render(); } catch(e) {}
   }, [paletteId]);
 
+  // Always rebuild LUT here so gamma/remap changes apply immediately to all pct- viewports
+  // Stack mode + MIP/PET: volume not allocated, show placeholder.
+  // CT viewports in stack mode work normally (setStack path).
+  if (!isVolume && (modality === 'MIP' || modality === 'PET')) {
+    return (
+      <div style={{
+        position: 'absolute', inset: 0, background: '#111',
+        display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center', gap: 6,
+      }}>
+        <div style={{ fontSize: 20, color: '#555' }}>{modality === 'MIP' ? 'MIP' : 'PET-CT'}</div>
+        <div style={{ fontSize: 9, color: '#444', textAlign: 'center', maxWidth: 140 }}>
+          Switch to Volume mode to enable {modality === 'MIP' ? 'MIP projection' : 'PET fusion'}
+        </div>
+        <div style={{ fontSize: 8, color: '#336699', marginTop: 4 }}>
+          Use the S/V button in System ribbon
+        </div>
+      </div>
+    );
+  }
+
+  if (modality === 'PET' && isVolume) {
+    glLUTRef.current = buildLUT(getColor, effectivePaletteId);
+  }
+
+  // When palette changes, trigger a render so drawFrame fires with the new LUT
+  useEffect(() => {
+    if (modality !== 'PET' || !isVolume || !hasVP.current) return;
+    try {
+      getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)?.render();
+    } catch(e) {}
+  }, [effectivePaletteId]);
+
   // Keep drawFrame refs in sync with latest prop values.
   // drawFrame reads these refs so it always uses current W/L and opacity
   // even though the canvas effect only mounts once (deps=[modality,isVolume,viewportId]).
@@ -536,15 +658,21 @@ export default function ViewerBox({
           try { vp.setProperties({ voiRange: _voi(wl), colormap: { name: cmap } }); }
           catch(e) { vp.setProperties({ voiRange: _voi(wl) }); }
         } else if (modality === 'PET') {
-          // updateFusionCtWL targets CT actor directly by referencedId — safe on
+          // updateFusionCtWL targets CT actor directly by referencedId - safe on
           // two-volume viewport. setFusionCtVOI (single-arg setProperties) must
-          // NOT be used here — it hits whichever volume CS3D considers current,
+          // NOT be used here - it hits whichever volume CS3D considers current,
           // which corrupts the PET VOI range and makes the overlay invisible.
           try { updateFusionCtWL(vp, ctWLFusion || { wc: 40, ww: 400 }); } catch(e) {}
           setFusionPetProperties(vp, { petWL: petWLFusion || wl, petColormapName: cmap, petOpacity });
-        } else { // MIP
-          try { vp.setProperties({ voiRange: _voi(wl), colormap: { name: cmap } }); }
-          catch(e) { vp.setProperties({ voiRange: _voi(wl) }); }
+        } else { // MIP - use actor-direct colormap to avoid changing background
+          try { vp.setProperties({ voiRange: _voi(wl) }); } catch(e) {}
+          // MIP LOCKED RULE: white background + true palette colour, for
+          // every palette including gray -- filter is always invert(1); the
+          // actor's own colours are pre-inverted to compensate (see
+          // setMIPColormap / _applyActorColormap's preInvertForWhiteBg).
+          // Do not change this without being explicitly asked to.
+          mipFilterRef.current = 'invert(1)';
+          setMIPColormap(vp, effectivePaletteId, wl);
         }
         vp.render();
       } else {
@@ -552,7 +680,7 @@ export default function ViewerBox({
         vp.render();
       }
     } catch(e) {}
-  }, [wl, paletteId, ctWLFusion, petWLFusion]);
+  }, [wl, paletteId, effectivePaletteId, ctWLFusion, petWLFusion]);
 
   // -- PET overlay opacity (fusion blend slider) -----------------------------
   useEffect(() => {
@@ -581,8 +709,16 @@ export default function ViewerBox({
 
     // Phase 3: in volume/MPR mode the "Crosshair" toolbar button promotes the
     // always-visible reference lines to full click-to-navigate on left drag.
-    if (isVolume) setCrosshairsActive(activeToolOverride === 'crosshair');
-    if (activeToolOverride === 'crosshair') return; // handled by setCrosshairsActive
+    // Crosshairs now lives on Auxiliary (middle-click) and is switched on once
+    // by ViewportGrid.jsx after volumes finish loading -- it no longer needs
+    // to be force-disabled here just because a different toolbar tool (Pan,
+    // Circle ROI, etc.) became active, since none of those use the middle
+    // button. The toolbar "Crosshair" id is kept only as an explicit re-toggle
+    // (e.g. to switch back to WindowLevel-on-middle-click).
+    if (isVolume && activeToolOverride === 'crosshair') {
+      setCrosshairsActive(true);
+      return; // handled by setCrosshairsActive
+    }
 
     // Map ribbon ids -> CS3D toolNames; unknown/action ids restore Pan.
     const csName = activeToolOverride ? TOOL_ID_TO_CS[activeToolOverride] : null;
@@ -635,6 +771,28 @@ export default function ViewerBox({
       });
     } catch(e) {}
   }, [activeToolOverride, toolGroupId]);
+
+  // -- Middle mouse wheel - PET opacity (PET viewports only) ------------------
+  // Scroll up = more PET, scroll down = less PET. Step 5% per notch.
+  // Only fires when middle button (button=1) is held OR as a standalone wheel
+  // on PET viewports (since middle drag is already W/L via CS3D).
+  useEffect(() => {
+    if (modality !== 'PET' || !isVolume || !onOpacity) return;
+    const el = divRef.current;
+    if (!el) return;
+    const onWheel = (e) => {
+      // Only intercept if middle button is held (buttons & 4) to avoid
+      // conflicting with normal scroll-to-slice
+      if (!(e.buttons & 4)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const delta = e.deltaY < 0 ? 0.05 : -0.05;  // up = more, down = less
+      const newVal = Math.max(0, Math.min(1, petOpacityRef.current + delta));
+      onOpacity(newVal);
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [modality, isVolume, onOpacity]);
 
   // -- Right-click delete popup ----------------------------------------------
   // CS3D captures right-button for Zoom. We detect a right-click that didn't
@@ -706,9 +864,81 @@ export default function ViewerBox({
         if (isPCT) {
           ann.metadata.rowShared   = true
           ann.metadata.viewportRow = 'pct'
+
+          // P0 ROOT CAUSE FIX: CS3D sets metadata.referencedImageId on every
+          // annotation to the specific imageId active at draw time. In MPR/
+          // volume mode each orientation has its own imageId sequence. When
+          // pct-coronal tries to render an annotation whose referencedImageId
+          // belongs to pct-axial's sequence, CS3D rejects it (imageId mismatch)
+          // and skips drawing entirely regardless of visibility flags.
+          // Clearing referencedImageId forces CS3D to fall through to
+          // FrameOfReferenceUID comparison (shared by all 6 viewports), making
+          // the annotation eligible on any pct- plane. CS3D's world-space
+          // plane-intersection test then determines whether the annotation
+          // geometry actually intersects the current slice.
+          ann.metadata.referencedImageId = undefined
+
+          // SUV-only display rule: hide native HU textbox for pct- annotations
+          // (pct- viewports only load CT into VTK; PET is Canvas2D overlay).
+          // Global textBoxVisibility stays ON for ct- rows.
+          try {
+            annotation.config.style.setAnnotationStyles(ann.annotationUID, {
+              textBoxVisibility: false,
+            })
+          } catch(e) {}
         }
 
         console.log(`[ViewerBox] tagged annotation to ${viewportId}${isPCT ? ' (row-shared pct)' : ''}`)
+
+        // IMAGE-SHIFT FIX (Rule 32, during-draw):
+        // CAMERA_MODIFIED fires synchronously the moment VTK resets the camera
+        // during a render() call. This is the correct event to intercept --
+        // IMAGE_RENDERED fires after the frame is already painted (too late to
+        // prevent the visible shift). We restore the locked parallelScale and
+        // focalPoint immediately inside the CAMERA_MODIFIED handler, before the
+        // next paint. Released on ANNOTATION_COMPLETED.
+        try {
+          const _engine = getRenderingEngine(RENDERING_ENGINE_ID)
+          const LOCK_IDS = ['pct-axial', 'pct-coronal', 'pct-sagittal', 'mip']
+          const _lockedCams = {}
+          const _camModFns  = {}
+          const _unlockFns  = {}
+          let _drawActive = true
+          LOCK_IDS.forEach(vpId => {
+            try {
+              const _vp = _engine?.getViewport(vpId)
+              if (!_vp?.element) return
+              _lockedCams[vpId] = _vp.getCamera()
+              // Restore parallelScale + focalPoint on every CAMERA_MODIFIED
+              // that occurs while drawing is active. Guarded so that legitimate
+              // user pan/zoom (which fires after _drawActive=false) is not blocked.
+              _camModFns[vpId] = () => {
+                if (!_drawActive) return
+                try {
+                  const cur = _vp.getCamera()
+                  const locked = _lockedCams[vpId]
+                  if (!locked?.parallelScale) return
+                  // Only restore if parallelScale or focalPoint drifted
+                  const scaleDrift = Math.abs((cur?.parallelScale || 0) - locked.parallelScale) > 1
+                  if (scaleDrift) {
+                    _vp.setCamera({ ...cur, parallelScale: locked.parallelScale, focalPoint: locked.focalPoint, position: locked.position })
+                  }
+                } catch(e) {}
+              }
+              _unlockFns[vpId] = () => {
+                _vp.element?.removeEventListener(Events.CAMERA_MODIFIED, _camModFns[vpId])
+              }
+              _vp.element.addEventListener(Events.CAMERA_MODIFIED, _camModFns[vpId])
+            } catch(e) {}
+          })
+          const _unlockAll = () => {
+            _drawActive = false
+            LOCK_IDS.forEach(vpId => { try { _unlockFns[vpId]?.() } catch(e) {} })
+          }
+          eventTarget.addEventListener('CORNERSTONE_TOOLS_ANNOTATION_COMPLETED', _unlockAll, { once: true })
+          // Safety: also unlock on cancel (e.g. Escape key)
+          eventTarget.addEventListener('CORNERSTONE_TOOLS_ANNOTATION_CANCELLED', _unlockAll, { once: true })
+        } catch(e) {}
 
         // Do NOT pre-position the textbox here. CS3D's getTextBoxCoordsCanvas
         // places text at the rightmost annotation point + 25px, which is
@@ -740,6 +970,53 @@ export default function ViewerBox({
         if (!ann) return
         ann.invalidated = true
 
+        // -- Auto cross-plane navigation (re-attempted, minimal) -----------------
+        // Two prior attempts both caused the source viewport itself to jump.
+        // Both of those attempts explicitly snapshotted and restored the
+        // SOURCE viewport's camera as a defensive measure -- but this code
+        // never directly modifies the source viewport's camera at all, only
+        // the two SIBLING viewports. That source-camera "restore" was
+        // unnecessary defensive complexity, and is the most likely single
+        // variable responsible for the jump (a malformed/late setCamera call
+        // against a viewport this code has no real reason to touch). This
+        // version removes it entirely: only the sibling planes' cameras are
+        // moved, the source viewport is never read or written here.
+        try {
+          const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
+          const pts = ann.data?.handles?.points
+          if (myRow && pts?.length) {
+            // Centroid of all handle points: for CircleROI points[0] already IS
+            // the centre (mean of 1 point = itself); for Ellipse (4 pts) and
+            // Rectangle (2 corner pts) the mean gives the true geometric centre.
+            const n = pts.length
+            const centre = [0, 1, 2].map(
+              axis => pts.reduce((s, p) => s + (p[axis] || 0), 0) / n
+            )
+            const ROW_VIEWPORTS = {
+              ct:  ['ct-axial',  'ct-coronal',  'ct-sagittal'],
+              pct: ['pct-axial', 'pct-coronal', 'pct-sagittal'],
+            }
+            const engine = getRenderingEngine(RENDERING_ENGINE_ID)
+            const camOverrides = {}
+            ;(ROW_VIEWPORTS[myRow] || []).forEach(vpId => {
+              if (vpId === viewportId) return // never touch the source plane
+              try {
+                const otherVp = engine?.getViewport(vpId)
+                if (!otherVp) return
+                const cam = otherVp.getCamera()
+                if (!cam?.focalPoint || !cam?.position) return
+                const delta = [0, 1, 2].map(axis => centre[axis] - cam.focalPoint[axis])
+                const newPosition = cam.position.map((p, axis) => p + delta[axis])
+                const newCam = { ...cam, focalPoint: [...centre], position: newPosition }
+                otherVp.setCamera(newCam)
+                camOverrides[vpId] = newCam
+                // No render() here -- tryRender below handles all rendering
+                // with camOverrides so cameras survive VTK reset (Rule 32).
+              } catch(e) {}
+            })
+          }
+        } catch(e) {}
+
         // Build the list of viewports to trigger.
         // If this is a row-shared pct annotation, include all pct- viewports
         // so every plane gets its own stats (axial SUV != coronal SUV because
@@ -749,6 +1026,8 @@ export default function ViewerBox({
           ? ['pct-axial', 'pct-coronal', 'pct-sagittal']
           : [viewportId]
 
+        const _camOverrides = (typeof camOverrides !== 'undefined') ? camOverrides : {}
+
         let attempts = 0
         const tryRender = () => {
           attempts++
@@ -756,10 +1035,10 @@ export default function ViewerBox({
             const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)
             if (!vp) return
             ann.invalidated = true
-            // Use CS3D's targeted annotation render API -- guarantees renderAnnotation
-            // is called for every tool on this viewport, which re-runs cachedStats.
+            // Pass _camOverrides so sibling viewports stay at the navigated
+            // slice position after VTK reset (Rule 32).
             try {
-              triggerAnnotationRenderForViewportIds(triggerIds)
+              triggerAnnotationRenderForViewportIds(triggerIds, _camOverrides)
             } catch(e) {
               vp.render()  // fallback if the API throws
             }
@@ -939,17 +1218,36 @@ export default function ViewerBox({
     } catch(e) {}
   }, [viewportId])
 
-  // -- ANNOTATION_RENDERED: clamp textbox + draw handle dots -----------------
+  // -- ANNOTATION_RENDERED: clamp textbox + draw handle dots + SUV text ------
   // Fires after every SVG annotation repaint with current canvas coordinates.
+  //
+  // HOVER-GATED HANDLES (fix for "dots always visible"):
+  //   Handle dots (resize/move affordances) are only drawn for the annotation
+  //   the pointer is currently near (hoveredUIDRef) or that is selected
+  //   (selectedUIDsRef) -- not for every ROI all the time. A pointermove
+  //   listener hit-tests proximity each frame (rAF-throttled) and rebuilds
+  //   just the overlay (cheap: no CS3D render needed) on change.
+  //
+  // SUV TEXTBOX (fix for "SUV never shown"):
+  //   pct- viewports only ever load the CT volume into VTK (PET is a Canvas2D
+  //   overlay -- see canvasFusion.js), so CS3D's native ROI textbox can only
+  //   ever compute CT/HU stats there. The native textbox for row-shared pct
+  //   annotations is suppressed at creation time (see onAdded above, which
+  //   sets textBoxVisibility:false per-annotation). Here we paint our own
+  //   textbox using suvUtils.roiStatsFromAnnotation, which samples the real
+  //   PET volume. ct- (CT-only) viewports are untouched and keep the native
+  //   HU textbox (global textBoxVisibility is ON for them).
+  const hoveredUIDRef   = useRef(null)
+  const [selectedUIDs, setSelectedUIDs] = useState([]);
+  const selectedUIDsRef = useRef([])
+  useEffect(() => { selectedUIDsRef.current = selectedUIDs }, [selectedUIDs])
+
   useEffect(() => {
     const RENDERED = 'CORNERSTONE_TOOLS_ANNOTATION_RENDERED'
+    const svgns = 'http://www.w3.org/2000/svg'
+    const OVERLAY_TOOLS = ['CircleROI', 'EllipticalROI', 'RectangleROI']
 
-    function onAnnotationRendered(evt) {
-      if (evt.detail?.viewportId !== viewportId) return
-      // 1) Clamp all textboxes into the safe zone.
-      _clampAllTextboxes()
-
-      // 2) Draw handle dots for ROI tools.
+    function _rebuildOverlay() {
       try {
         const el = divRef.current
         if (!el) return
@@ -959,22 +1257,22 @@ export default function ViewerBox({
         // -- Handle overlay ----------------------------------------------------
         // CS3D draws its own native <circle class="handle"> dots at the raw
         // points[] positions (2 for Circle, 4 for Ellipse, 2 for Rect).
-        // We want richer geometry. Hide CS3D's dots per annotation UID (scoped --
-        // LengthTool / Arrow etc. keep their own dots), then draw ours.
+        // We want richer geometry AND hover-only visibility. Hide CS3D's dots
+        // per annotation UID (scoped -- LengthTool / Arrow etc. keep their own
+        // dots), then draw ours only for the hovered/selected annotation.
         const svgLayer = el.querySelector('div.viewport-element > svg.svg-layer')
         if (!svgLayer) return
         svgLayer.querySelector('#handle-overlay')?.remove()
-        const svgns = 'http://www.w3.org/2000/svg'
         const g = document.createElementNS(svgns, 'g')
         g.setAttribute('id', 'handle-overlay')
 
-        const OVERLAY_TOOLS = ['CircleROI', 'EllipticalROI', 'RectangleROI']
         const all = annotation.state.getAllAnnotations()
         const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
+        const isPCTRow = myRow === 'pct'
 
         for (const ann of (all || [])) {
-          // Draw handles for annotations that belong to this viewport either
-          // exclusively (sourceViewportId) or as row-shared (viewportRow matches).
+          // Belongs to this viewport either exclusively (sourceViewportId) or
+          // as row-shared (viewportRow matches, e.g. SUV ROI on all 3 pct- planes).
           const src = ann.metadata?.sourceViewportId
           const rowShared = ann.metadata?.rowShared && ann.metadata?.viewportRow === myRow
           if (src !== viewportId && !rowShared) continue
@@ -984,11 +1282,76 @@ export default function ViewerBox({
           const pts = ann.data?.handles?.points
           if (!pts || pts.length < 2) continue
 
-          // Hide CS3D's native handle dots for this annotation only.
+          // Always hide CS3D's native handle dots for this annotation -- ours
+          // replace them whenever shown, and we don't want a flash of the
+          // native dots while ours are hidden.
           try {
             svgLayer.querySelectorAll(`[data-id="${ann.annotationUID}"] circle.handle`)
               .forEach(c => { c.style.display = 'none' })
           } catch(e) {}
+
+          // -- SUV textbox (pct- rows only) ------------------------------------
+          // Drawn regardless of hover state -- the VALUE should always be
+          // visible, only the resize/move HANDLES are hover-gated.
+          //
+          // CLAMPING: this is a plain SVG <text>, not a CS3D textBox, so it
+          // never went through _clampAllTextboxes and could render past the
+          // viewport edge (clipped by the colour strip / label bars, or off
+          // the box entirely for an ROI near the boundary). Clamp it into the
+          // same safe zone used elsewhere (PL/PR/PT/PB), estimating text width
+          // from character count since the node isn't in the DOM yet to measure.
+          if (isPCTRow) {
+            try {
+              const stats = roiStatsFromAnnotation(ann, true)
+              const label = stats.uncalibrated
+                ? (stats.uncalibratedReason || 'SUV unavailable')
+                : `SUV Mean ${stats.suvMean ?? '—'}  Max ${stats.suvMax ?? '—'}`
+
+              const c_cv = vp.worldToCanvas(pts[0])
+              const PL = 8, PR = 30, PT = 22, PB = 28
+              const FONT_PX  = 12
+              const CHAR_W   = FONT_PX * 0.62   // monospace approx
+              const txtW     = label.length * CHAR_W
+              const txtH     = FONT_PX
+              const elW      = el.clientWidth  || vp.element?.clientWidth  || 0
+              const elH      = el.clientHeight || vp.element?.clientHeight || 0
+
+              let tx = Math.round(c_cv[0]) + 14   // text-anchor is start (left edge)
+              let ty = Math.round(c_cv[1]) - 14   // baseline
+
+              if (elW > 0) {
+                if (tx + txtW > elW - PR) tx = elW - PR - txtW
+                if (tx < PL) tx = PL
+              }
+              if (elH > 0) {
+                // ty is the text baseline; top of glyphs is roughly ty - txtH
+                if (ty - txtH < PT) ty = PT + txtH
+                if (ty > elH - PB) ty = elH - PB
+              }
+
+              const txt = document.createElementNS(svgns, 'text')
+              txt.setAttribute('x', String(Math.round(tx)))
+              txt.setAttribute('y', String(Math.round(ty)))
+              txt.setAttribute('font-family', 'monospace')
+              txt.setAttribute('font-size', `${FONT_PX}px`)
+              txt.setAttribute('fill', 'rgb(255,222,0)')
+              txt.setAttribute('paint-order', 'stroke')
+              txt.setAttribute('stroke', 'rgba(0,0,0,0.7)')
+              txt.setAttribute('stroke-width', '3')
+              txt.setAttribute('pointer-events', 'none')
+              txt.textContent = label
+              g.appendChild(txt)
+            } catch(e) {}
+          }
+
+          // -- Handle dots: hover/selected only ---------------------------------
+          // Hover-only, per spec: a freshly-drawn annotation is auto-selected
+          // by CS3D and stays selected until something else is clicked, which
+          // previously kept its handles visible "at all times" even with the
+          // pointer elsewhere. Selection is still used for the delete toolbar
+          // (selectedUIDs state), just not for handle-dot visibility here.
+          const isHovered = hoveredUIDRef.current === ann.annotationUID
+          if (!isHovered) continue
 
           const addDot = (wp, r, fill) => {
             try {
@@ -1036,6 +1399,12 @@ export default function ViewerBox({
       } catch(e) {}
     }
 
+    function onAnnotationRendered(evt) {
+      if (evt.detail?.viewportId !== viewportId) return
+      _clampAllTextboxes()
+      _rebuildOverlay()
+    }
+
     const MODIFIED = 'CORNERSTONE_TOOLS_ANNOTATION_MODIFIED'
 
     // Register clamp on every repaint and on annotation data changes
@@ -1056,47 +1425,108 @@ export default function ViewerBox({
     }
     if (el) el.addEventListener('pointerup', onPointerUp)
 
+    // -- Hover detection (rAF-throttled) for handle-dot visibility -------------
+    // Hit-tests pointer proximity against this viewport's ROI annotations
+    // (same geometry the interior-hit patch in cornerstone-init.js uses) and
+    // only rebuilds the overlay when the hovered UID actually changes, so we
+    // don't thrash the SVG on every mousemove.
+    let rafPending = false
+    let lastClientXY = null
+    function _hitTestHover() {
+      rafPending = false
+      if (!lastClientXY) return
+      try {
+        const vp = getRenderingEngine(RENDERING_ENGINE_ID)?.getViewport(viewportId)
+        if (!vp || !vp.element) return
+        const rect = vp.element.getBoundingClientRect()
+        const cx = lastClientXY[0] - rect.left
+        const cy = lastClientXY[1] - rect.top
+        const all = annotation.state.getAllAnnotations() || []
+        const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
+        let foundUID = null, bestDist = Infinity
+        for (const ann of all) {
+          const src = ann.metadata?.sourceViewportId
+          const rowShared = ann.metadata?.rowShared && ann.metadata?.viewportRow === myRow
+          if (src !== viewportId && !rowShared) continue
+          const toolName = ann.metadata?.toolName || ''
+          if (!OVERLAY_TOOLS.includes(toolName)) continue
+          const pts = ann.data?.handles?.points
+          if (!pts?.length) continue
+          if (toolName === 'CircleROI') {
+            const c_cv = vp.worldToCanvas(pts[0])
+            const r_cv = vp.worldToCanvas(pts[1])
+            const radius = Math.hypot(r_cv[0]-c_cv[0], r_cv[1]-c_cv[1])
+            const dist = Math.hypot(cx - c_cv[0], cy - c_cv[1])
+            if (Math.abs(dist - radius) <= 14 || dist <= 14) {
+              if (dist < bestDist) { bestDist = dist; foundUID = ann.annotationUID }
+            }
+          } else {
+            // Generic: near any handle point (covers Ellipse/Rect corners + edges).
+            for (const wp of pts) {
+              const cv = vp.worldToCanvas(wp)
+              const dist = Math.hypot(cx - cv[0], cy - cv[1])
+              if (dist <= 14 && dist < bestDist) { bestDist = dist; foundUID = ann.annotationUID }
+            }
+          }
+        }
+        if (hoveredUIDRef.current !== foundUID) {
+          hoveredUIDRef.current = foundUID
+          _rebuildOverlay()
+        }
+      } catch(e) {}
+    }
+    const onPointerMove = (e) => {
+      lastClientXY = [e.clientX, e.clientY]
+      if (!rafPending) { rafPending = true; requestAnimationFrame(_hitTestHover) }
+    }
+    const onPointerLeave = () => {
+      lastClientXY = null
+      if (hoveredUIDRef.current !== null) { hoveredUIDRef.current = null; _rebuildOverlay() }
+    }
+    if (el) {
+      el.addEventListener('pointermove', onPointerMove)
+      el.addEventListener('pointerleave', onPointerLeave)
+    }
+
     return () => {
       eventTarget.removeEventListener(RENDERED, onAnnotationRendered)
       eventTarget.removeEventListener(MODIFIED, onAnnotationRendered)
-      if (el) el.removeEventListener('pointerup', onPointerUp)
+      if (el) {
+        el.removeEventListener('pointerup', onPointerUp)
+        el.removeEventListener('pointermove', onPointerMove)
+        el.removeEventListener('pointerleave', onPointerLeave)
+      }
     }
   }, [viewportId, _clampAllTextboxes])
 
   function _applyViewportVisibility() {
-    // VOLUME / MPR mode: do NOT touch annotation visibility. CS3D's annotation
-    // visibility is GLOBAL, not per-viewport -- and in MPR all six viewports share
-    // the CT frame of reference, so hiding "other viewports'" annotations here
-    // hides them EVERYWHERE, including the box they were just drawn in (they flash
-    // then vanish). CS3D already scopes annotations by plane in MPR, so no manual
-    // hiding is needed; an axial line simply won't render in coronal/sagittal.
-    if (isVolume) return;
+    // Ensure all tagged annotations have correct visibility state.
+    // Row-shared pct annotations are globally visible (CS3D plane-intersection
+    // handles which plane they appear on). Single-viewport annotations are
+    // shown only on their own source viewport.
     try {
       const all = annotation.state.getAllAnnotations()
       if (!all?.length) return
-      let changed = false
       all.forEach(ann => {
         const src = ann.metadata?.sourceViewportId
-        if (!src) return // untagged -- don't touch
-
-        let shouldShow
-        if (ann.metadata?.rowShared && ann.metadata?.viewportRow) {
-          // Row-shared annotation: visible on all viewports in the same row.
-          // (In stack mode this keeps the annotation visible on its source viewport;
-          //  volume mode handles row visibility via filterInteractableAnnotationsForElement.)
-          const myRow = viewportId.startsWith('pct-') ? 'pct' : viewportId.startsWith('ct-') ? 'ct' : null
-          shouldShow = myRow === ann.metadata.viewportRow
-        } else {
-          shouldShow = src === viewportId
-        }
-
-        const currently  = annotation.visibility.isAnnotationVisible(ann.annotationUID)
-        if (shouldShow !== currently) {
-          annotation.visibility.setAnnotationVisibility(ann.annotationUID, shouldShow)
-          changed = true
-        }
+        if (!src) return // untagged (crosshairs, CS3D internals) -- never touch
+        try {
+          // Row-shared: always globally visible (plane filter handles the rest)
+          if (ann.metadata?.rowShared) {
+            if (!annotation.visibility.isAnnotationVisible(ann.annotationUID)) {
+              annotation.visibility.setAnnotationVisibility(ann.annotationUID, true)
+            }
+            return
+          }
+          // Single-viewport: visible only; never explicitly hide from here
+          // (global hide would remove it from the source viewport too)
+          if (src === viewportId) {
+            if (!annotation.visibility.isAnnotationVisible(ann.annotationUID)) {
+              annotation.visibility.setAnnotationVisibility(ann.annotationUID, true)
+            }
+          }
+        } catch(e) {}
       })
-      if (changed) _renderViewport()
     } catch(e) {}
   }
 
@@ -1104,7 +1534,6 @@ export default function ViewerBox({
   // Track selected annotation UIDs via CS3D ANNOTATION_SELECTION_CHANGE event.
   // Show a floating delete toolbar when any annotation is selected.
   // NO right-click context menu -- right-click is reserved for Zoom.
-  const [selectedUIDs,    setSelectedUIDs]    = useState([]);
   const [drawingComplete, setDrawingComplete] = useState(false);
 
   useEffect(() => {
@@ -1170,6 +1599,33 @@ export default function ViewerBox({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [])
 
+  // Explicitly clear the custom SVG overlay (handle dots + SUV/HU text drawn
+  // by _rebuildOverlay elsewhere in this file) on every viewport that could
+  // be showing it for a just-deleted annotation. Necessary because that
+  // overlay only rebuilds in response to CS3D's ANNOTATION_RENDERED/MODIFIED
+  // events, and deleting the LAST annotation on a viewport apparently doesn't
+  // reliably fire those (there's nothing left for CS3D itself to render) --
+  // which is exactly why the "Patient weight missing" SUV text was staying
+  // on screen after the ROI that produced it was deleted. A plain image
+  // render() (used elsewhere for _renderAll) doesn't touch this overlay at
+  // all, since it's not part of CS3D's own annotation rendering pipeline.
+  function _clearStaleOverlays() {
+    try {
+      const engine = getRenderingEngine(RENDERING_ENGINE_ID)
+      const ids = ['ct-axial', 'ct-coronal', 'ct-sagittal', 'pct-axial', 'pct-coronal', 'pct-sagittal']
+      ids.forEach(id => {
+        try {
+          const vp = engine?.getViewport(id)
+          const el = vp?.element
+          if (!el) return
+          el.querySelector('div.viewport-element > svg.svg-layer')
+            ?.querySelector('#handle-overlay')
+            ?.remove()
+        } catch(e) {}
+      })
+    } catch(e) {}
+  }
+
   function _deleteSelected() {
     try {
       // Prefer the UIDs we captured on selection-change (the live selection is
@@ -1177,6 +1633,7 @@ export default function ViewerBox({
       let uids = selectedUIDs;
       if (!uids?.length) uids = annotation.selection.getAnnotationsSelected() || [];
       uids.forEach(uid => { try { annotation.state.removeAnnotation(uid); } catch(e) {} });
+      _clearStaleOverlays();
       _renderAll();
     } catch(e) {}
     setSelectedUIDs([]);
@@ -1185,6 +1642,7 @@ export default function ViewerBox({
   function _deleteAnnotation(uid) {
     try {
       annotation.state.removeAnnotation(uid);
+      _clearStaleOverlays();
       _renderAll();
     } catch(e) {}
     setSelectedUIDs([]);
@@ -1228,7 +1686,7 @@ export default function ViewerBox({
   function _deleteAtPoint(clientX, clientY) {
     const hit = _annotationAtClient(clientX, clientY);
     if (hit) {
-      try { annotation.state.removeAnnotation(hit.annotationUID); _renderAll(); } catch(e) {}
+      try { annotation.state.removeAnnotation(hit.annotationUID); _clearStaleOverlays(); _renderAll(); } catch(e) {}
       setSelectedUIDs([]);
       return;
     }
@@ -1250,6 +1708,7 @@ export default function ViewerBox({
           annotation.state.removeAnnotation(ann.annotationUID)
         }
       })
+      _clearStaleOverlays()
       _renderAll()
     } catch(e) {}
     setSelectedUIDs([])
@@ -1277,6 +1736,43 @@ export default function ViewerBox({
   const openPre  = () => { clearTimeout(closeTimers.current.pre); setShowPresets(true); };
   const closePre = () => { closeTimers.current.pre = setTimeout(() => setShowPresets(false), 180); };
 
+  // -- Drag-and-drop series loading -------------------------------------------
+  // Only wired when ViewportGrid passed onSeriesDrop (ct-axial / pct-axial
+  // only). Validates the dropped series' modality matches what this box
+  // expects, and that it belongs to the currently-loaded study (SeriesPanel
+  // should only ever offer the current study's series, but a stale drag from
+  // before a study switch is defensively rejected too) before bubbling it up.
+  const _expectedModalities = modality === 'CT' ? ['CT'] : (modality === 'PET' || modality === 'MIP') ? ['PT', 'PET'] : [];
+  const handleSeriesDragOver = (e) => {
+    if (!onSeriesDrop) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    if (!seriesDragOver) setSeriesDragOver(true);
+  };
+  const handleSeriesDragLeave = () => { if (seriesDragOver) setSeriesDragOver(false); };
+  const handleSeriesDrop = (e) => {
+    if (!onSeriesDrop) return;
+    e.preventDefault();
+    setSeriesDragOver(false);
+    try {
+      const raw = e.dataTransfer.getData('application/petct-series');
+      if (!raw) return;
+      const payload = JSON.parse(raw);
+      if (!payload?.seriesUID || !payload?.modality) return;
+      if (!_expectedModalities.includes(payload.modality)) {
+        console.warn(`[ViewerBox] rejected drop: ${payload.modality} series onto ${modality} box`);
+        return;
+      }
+      if (dropStudyUID && payload.studyUID && payload.studyUID !== dropStudyUID) {
+        console.warn('[ViewerBox] rejected drop: series belongs to a different study');
+        return;
+      }
+      onSeriesDrop(payload.modality, payload.seriesUID);
+    } catch(e) {
+      console.warn('[ViewerBox] series drop parse failed:', e?.message);
+    }
+  };
+
   // -- Render ----------------------------------------------------------------
   return (
     <div
@@ -1303,15 +1799,20 @@ export default function ViewerBox({
         <div
           ref={divRef}
           onContextMenu={e => e.preventDefault()}
+          onDragOver={handleSeriesDragOver}
+          onDragLeave={handleSeriesDragLeave}
+          onDrop={handleSeriesDrop}
           style={{
             position: 'absolute', inset: 0,
             overflow: 'hidden',
             clipPath: 'inset(0)',
             background: modality === 'MIP' ? '#ffffff' : '#000000',
+            outline: seriesDragOver ? `2px dashed ${accentColor}` : 'none',
+            outlineOffset: -2,
           }}
         />
 
-        {/* Canvas2D PET fusion overlay — INSIDE position:relative so inset:0
+        {/* Canvas2D PET fusion overlay - INSIDE position:relative so inset:0
             places it exactly over the WebGL canvas. pointer-events:none passes
             all mouse events through to CS3D underneath. */}
         {modality === 'PET' && isVolume && (
@@ -1411,15 +1912,14 @@ export default function ViewerBox({
         onSelectPalette={id => {
           setPaletteId(id);
           setShowPalMenu(false);
-          // PET: notify parent to sync all 3 pct- boxes (not MIP — no onPaletteChange passed for MIP)
+          // PET: notify parent to sync all 3 pct- boxes (not MIP - no onPaletteChange passed for MIP)
           if (modality === 'PET' && onPaletteChange) onPaletteChange(id);
         }}
       />
 
-      {/* PET opacity slider */}
-      {modality === 'PET' && onOpacity && (
-        <OpacityHandle opacity={petOpacity} onChange={onOpacity} />
-      )}
+      {/* PET opacity slider -- REMOVED per explicit instruction: redundant
+          now that the colour-strip's two compression cursors (below) serve
+          the same "make subtle differences stand out" purpose. */}
 
       {/* MIP orientation bar -- A/P/R/L/H/F buttons, MIP viewport only */}
       {modality === 'MIP' && (
@@ -1460,6 +1960,7 @@ export default function ViewerBox({
             boxShadow: '0 4px 16px rgba(0,0,0,.9)', minWidth: 160,
           }}
           onMouseDown={e => e.stopPropagation()}
+          onPointerDown={e => e.stopPropagation()}
         >
           <div style={{ padding: '4px 10px', fontSize: 8, color: '#555', borderBottom: '1px solid #1e1e1e', textTransform: 'uppercase', letterSpacing: 1 }}>
             Annotations
@@ -1625,7 +2126,7 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
   // Track playing in a ref so the rAF closure always sees the latest value
   const playingRef = useRef(false)
 
-  // ── Step: advance by one unit (slice or MIP angle step) ──────────────────
+  // -- Step: advance by one unit (slice or MIP angle step) ------------------
   function _stepMIP(angleDelta) {
     try {
       const engine = getRenderingEngine(RENDERING_ENGINE_ID)
@@ -1633,7 +2134,7 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
       if (!vp) return
       const cam = vp.getCamera()
       if (!cam?.focalPoint) return
-      const fp = cam.focalPoint          // volume centre — stays fixed
+      const fp = cam.focalPoint          // volume centre - stays fixed
       const dist = Math.hypot(
         cam.position[0] - fp[0],
         cam.position[1] - fp[1],
@@ -1643,11 +2144,11 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
       const rad = (angleRef.current * Math.PI) / 180
       // Orbit in the coronal plane: camera swings around the patient Z-axis.
       // Position: rotate (initial front = -Y direction) around Z.
-      // Clinical MIP rotation: A→RAO→R→RPO→P→LPO→L→LAO→A
+      // Clinical MIP rotation: A-RAO-R-RPO-P-LPO-L-LAO-A
       // In RAS coordinates: front = +Y (anterior), right = +X
       const newPos = [
-        fp[0] + dist * Math.sin(rad),   // X: 0 at 0°, +dist at 90° (right lat)
-        fp[1] - dist * Math.cos(rad),   // Y: -dist at 0° (anterior view)
+        fp[0] + dist * Math.sin(rad),   // X: 0 at 0-, +dist at 90- (right lat)
+        fp[1] - dist * Math.cos(rad),   // Y: -dist at 0- (anterior view)
         fp[2],                           // Z: unchanged
       ]
       vp.setCamera({
@@ -1678,7 +2179,7 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
     } catch(e) {}
   }
 
-  // ── rAF loop for MIP ─────────────────────────────────────────────────────
+  // -- rAF loop for MIP -----------------------------------------------------
   const fpsRef = useRef(fps)
   useEffect(() => { fpsRef.current = fps }, [fps])
 
@@ -1689,8 +2190,8 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
 
     function loop(ts) {
       if (!playingRef.current) return
-      // degrees/frame = rpm × 360° / 60sec / 60fps = rpm × 0.1
-      // At rpm=30: 3°/frame → 1 rev in 2s. At rpm=70: 7°/frame → 1 rev in 0.86s.
+      // degrees/frame = rpm - 360- / 60sec / 60fps = rpm - 0.1
+      // At rpm=30: 3-/frame - 1 rev in 2s. At rpm=70: 7-/frame - 1 rev in 0.86s.
       _stepMIP(fpsRef.current * 0.1)
       rAFRef.current = requestAnimationFrame(loop)
     }
@@ -1702,7 +2203,7 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
     }
   }, [playing, isMIP, viewportId])
 
-  // ── Interval loop for slice scroll ────────────────────────────────────────
+  // -- Interval loop for slice scroll ----------------------------------------
   useEffect(() => {
     if (isMIP || !playing) return
     playingRef.current = true
@@ -1817,7 +2318,7 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
   )
 }
 
-// ─── MIP Orientation Bar — 6 standard projection views ───────────────────────
+// --- MIP Orientation Bar - 6 standard projection views -----------------------
 // Renders inside the MIP viewport only. One click instantly re-orients the
 // camera to the chosen standard view: A/P/R/L/H(ead)/F(oot).
 //
@@ -1829,7 +2330,7 @@ function CineBar({ viewportId, modality, isMIP, mipPlaying, onMipPlayingChange }
 // RAS convention (standard DICOM): X=Right, Y=Anterior, Z=Superior/Head.
 // So for an Anterior view we look from in front (-Y side, position Y < fp.Y).
 //
-// Note: resetCamera() after setCamera() is intentional — it refits the whole
+// Note: resetCamera() after setCamera() is intentional - it refits the whole
 // volume to the viewport while using the orientation we just set. CS3D v2.1.16
 // resetCamera() respects the current camera viewUp and position direction.
 const MIP_VIEWS = [
@@ -1965,30 +2466,83 @@ function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, 
   const dragRef   = useRef({ active: false, lastY: 0 });
   const wlRef     = useRef(wl);
   useEffect(() => { wlRef.current = wl; }, [wl]);
+  const stripWrapRef = useRef(null);
+  const [hoverHandle, setHoverHandle]   = useState(null);  // 'upper' | 'lower' | null -- idle hover
+  const [activeHandle, setActiveHandle] = useState(null);  // 'upper' | 'lower' | null -- currently dragging
 
-  const frac = Math.max(0, Math.min(1, (wl.wc + 2000) / 6000));
+  // PET-CT (3 boxes) + MIP share this "compression cursor" behaviour, per
+  // explicit design: two independently-draggable absolute-position handles
+  // representing the LOWER and UPPER bound of the displayed W/L window
+  // directly (rather than the old single relative-drag-by-delta handle).
+  // Narrowing the gap between them is mathematically identical to narrowing
+  // ww while moving wc -- exactly like a standard CT HU windowing control --
+  // which is why it makes subtle PET/MIP intensity differences stand out.
+  // wl is already shared App-level state across all 3 pct- boxes AND mip
+  // (see ViewportGrid.jsx's wl={modality==='CT' ? ctWL : petWL}), so no new
+  // plumbing is needed for the "changing it in any of the 4 updates all 4"
+  // requirement -- dragging either handle just calls the existing onWLDrag.
+  const isCompressible = modality === 'PET' || modality === 'MIP';
+  const SCALE_MAX = 50000; // = DEF_PET_WL.wc + DEF_PET_WL.ww/2 -- default cursors land exactly at the strip's top/bottom edges
+  const MIN_GAP_255 = 25;    // minimum gap, in the SAME 0-255 scale the cursor labels show
+  const MIN_GAP   = (MIN_GAP_255 / 255) * SCALE_MAX; // converted to raw W/L units for the clamp math below
+
+  const lowerBound = isCompressible ? Math.max(0, wl.wc - wl.ww / 2) : 0;
+  const upperBound = isCompressible ? Math.min(SCALE_MAX, wl.wc + wl.ww / 2) : SCALE_MAX;
+  const fracLower = Math.max(0, Math.min(1, lowerBound / SCALE_MAX));
+  const fracUpper = Math.max(0, Math.min(1, upperBound / SCALE_MAX));
+  // Display only: cursor labels show a 0-255 scale position, not raw PET
+  // W/L units -- the underlying drag math is unchanged (still drives real
+  // wc/ww), this only affects what number the user sees on the label.
+  const upperDisplay255 = Math.round(fracUpper * 255);
+  const lowerDisplay255 = Math.round(fracLower * 255);
+
+  const frac = Math.max(0, Math.min(1, (wl.wc + 2000) / 6000)); // CT-only, unchanged
+
+  // Always-fresh snapshot for the ResizeObserver callback below, which is
+  // registered once (mount-only effect) and must never read stale closure
+  // values -- a resize firing after a cross-box drag updated fracLower/
+  // fracUpper would otherwise repaint with outdated numbers, silently
+  // undoing a correct compression that just happened.
+  const drawArgsRef = useRef(null);
+  drawArgsRef.current = { paletteId, frac, drawMarker: !isCompressible, fracLower, fracUpper };
 
   useEffect(() => {
     const c = canvasRef.current; if (!c) return;
-    const ro = new ResizeObserver(() => _drawStrip(c, paletteId, frac));
+    const ro = new ResizeObserver(() => {
+      const a = drawArgsRef.current;
+      _drawStrip(c, a.paletteId, a.frac, a.drawMarker, a.fracLower, a.fracUpper);
+    });
     ro.observe(c);
-    _drawStrip(c, paletteId, frac);
+    const a = drawArgsRef.current;
+    _drawStrip(c, a.paletteId, a.frac, a.drawMarker, a.fracLower, a.fracUpper);
     return () => ro.disconnect();
   }, []);
 
+  // No dependency array -- runs after EVERY render, unconditionally. This
+  // sidesteps a cross-box gradient-sync bug (PCT and MIP strips intermittently
+  // not reflecting each other's cursor changes) that survived multiple
+  // targeted fixes and could not be root-caused through static analysis of
+  // the prop chain. Rather than rely on a dependency-array comparison that
+  // may be missing something subtle, the canvas is now unconditionally
+  // redrawn with whatever fracLower/fracUpper/paletteId this render computed
+  // -- guaranteed correct on every single render, full stop.
   useEffect(() => {
     const c = canvasRef.current;
-    if (c) _drawStrip(c, paletteId, frac);
-  }, [paletteId, frac]);
+    if (c) _drawStrip(c, paletteId, frac, !isCompressible, fracLower, fracUpper);
+  });
 
+  // -- CT-only: original single relative-drag-by-delta handle ---------------
   const onMouseDown = (e) => {
+    if (isCompressible) return; // PET/MIP use the two dedicated handles below
     e.preventDefault(); e.stopPropagation();
     dragRef.current = { active: true, lastY: e.clientY };
     const mv = (ev) => {
       if (!dragRef.current.active) return;
       const dy = ev.clientY - dragRef.current.lastY;
       dragRef.current.lastY = ev.clientY;
-      const { wc, ww } = wlRef.current;
+      const cur = wlRef.current;
+      const wc = (cur && typeof cur === 'object' && Number.isFinite(cur.wc)) ? cur.wc : 40;
+      const ww = (cur && typeof cur === 'object' && Number.isFinite(cur.ww)) ? cur.ww : 400;
       onWLDrag(Math.max(-2000, Math.min(4000, wc - dy * 4)),
                Math.max(1, Math.min(8000, ww + Math.abs(dy) * 2)));
     };
@@ -1997,12 +2551,153 @@ function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, 
     window.addEventListener('mouseup', up);
   };
 
+  // -- PET/MIP: two independent absolute-position handles -------------------
+  // clientY -> fraction within the strip's current on-screen bounds (0 at
+  // bottom, 1 at top, matching the canvas gradient's own orientation).
+  function _fracFromClientY(clientY) {
+    const el = stripWrapRef.current;
+    if (!el) return 0;
+    const rect = el.getBoundingClientRect();
+    const topOffset = 20; // matches the compressible-mode marginTop above (18px header + 2px buffer)
+    const usable = Math.max(1, rect.height - topOffset);
+    const y = clientY - rect.top - topOffset;
+    return Math.max(0, Math.min(1, 1 - y / usable));
+  }
+
+  function _startHandleDrag(which) {
+    return (e) => {
+      e.preventDefault(); e.stopPropagation();
+      setActiveHandle(which);
+      // Capture the OTHER (non-dragged) handle's bound ONCE, at drag start --
+      // it doesn't move during this drag, so there's no reason to re-read it
+      // from wlRef (which lags behind fast mousemove events) on every move.
+      const cur = wlRef.current;
+      const fixedLower = Math.max(0, (cur?.wc ?? 0) - (cur?.ww ?? 0) / 2);
+      const fixedUpper = Math.min(SCALE_MAX, (cur?.wc ?? 0) + (cur?.ww ?? 0) / 2);
+
+      // THROTTLE (not just rAF-dedup): each onWLDrag call cascades into a
+      // full CS3D re-render on all 4 PET-CT/MIP viewports, MIP rebuilding
+      // its entire 256-entry colour LUT every time. Console violations
+      // showed requestAnimationFrame handlers taking 300+ms and setInterval
+      // blocking 3+ seconds during a drag -- firing this cascade up to 60x/
+      // second was overwhelming the main thread badly enough that updates
+      // queued up and appeared to apply inconsistently across boxes. 80ms
+      // minimum between actual state commits; the final mouse position is
+      // always applied immediately on release, never lost to the throttle.
+      const MIN_INTERVAL_MS = 80;
+      let lastFireTime = 0;
+      let pendingTimer = null;
+      let rafPending = false;
+      let latestClientY = e.clientY;
+
+      const _commit = () => {
+        lastFireTime = Date.now();
+        const f = _fracFromClientY(latestClientY);
+        const raw = f * SCALE_MAX;
+        let newLower = fixedLower, newUpper = fixedUpper;
+        if (which === 'lower') {
+          newLower = Math.max(0, Math.min(raw, fixedUpper - MIN_GAP));
+        } else {
+          newUpper = Math.min(SCALE_MAX, Math.max(raw, fixedLower + MIN_GAP));
+        }
+        const newWc = (newLower + newUpper) / 2;
+        const newWw = Math.max(MIN_GAP, newUpper - newLower);
+        onWLDrag(newWc, newWw);
+      };
+      const _apply = () => {
+        rafPending = false;
+        const elapsed = Date.now() - lastFireTime;
+        if (elapsed >= MIN_INTERVAL_MS) {
+          if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+          _commit();
+        } else if (!pendingTimer) {
+          pendingTimer = setTimeout(() => { pendingTimer = null; _commit(); }, MIN_INTERVAL_MS - elapsed);
+        }
+      };
+      const mv = (ev) => {
+        latestClientY = ev.clientY;
+        if (!rafPending) { rafPending = true; requestAnimationFrame(_apply); }
+      };
+      const up = () => {
+        // Guarantee the exact release position is applied, bypassing the throttle.
+        if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+        _commit();
+        setActiveHandle(null);
+        window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up);
+      };
+      window.addEventListener('mousemove', mv);
+      window.addEventListener('mouseup', up);
+    };
+  }
+
+  // -- PET/MIP: pan BOTH cursors together, preserving the exact gap ---------
+  // Hovering the strip body (anywhere except directly on a cursor line) shows
+  // a move/pan cursor; dragging there shifts the whole window up/down without
+  // changing its width -- e.g. upper=200/lower=25 (gap 175) stays gap-175
+  // throughout the pan, only wc shifts. Clamped at the edges so the gap can
+  // never be altered by hitting 0 or SCALE_MAX -- the delta itself gets
+  // capped, not either bound individually.
+  function _startPanDrag(e) {
+    e.preventDefault(); e.stopPropagation();
+    setActiveHandle('pan');
+    const cur = wlRef.current;
+    const startLower = Math.max(0, (cur?.wc ?? 0) - (cur?.ww ?? 0) / 2);
+    const startUpper = Math.min(SCALE_MAX, (cur?.wc ?? 0) + (cur?.ww ?? 0) / 2);
+    const gap = startUpper - startLower;
+    const startFrac = _fracFromClientY(e.clientY);
+
+    const MIN_INTERVAL_MS = 80; // same throttle rationale as _startHandleDrag
+    let lastFireTime = 0;
+    let pendingTimer = null;
+    let rafPending = false;
+    let latestClientY = e.clientY;
+
+    const _commit = () => {
+      lastFireTime = Date.now();
+      const f = _fracFromClientY(latestClientY);
+      const rawDelta = (f - startFrac) * SCALE_MAX;
+      // Clamp the DELTA itself (not either bound separately) so the gap is
+      // never altered by hitting an edge -- both bounds move together or not at all.
+      const clampedDelta = Math.max(-startLower, Math.min(SCALE_MAX - startUpper, rawDelta));
+      const newLower = startLower + clampedDelta;
+      const newUpper = newLower + gap;
+      const newWc = (newLower + newUpper) / 2;
+      const newWw = gap;
+      onWLDrag(newWc, newWw);
+    };
+    const _apply = () => {
+      rafPending = false;
+      const elapsed = Date.now() - lastFireTime;
+      if (elapsed >= MIN_INTERVAL_MS) {
+        if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+        _commit();
+      } else if (!pendingTimer) {
+        pendingTimer = setTimeout(() => { pendingTimer = null; _commit(); }, MIN_INTERVAL_MS - elapsed);
+      }
+    };
+    const mv = (ev) => {
+      latestClientY = ev.clientY;
+      if (!rafPending) { rafPending = true; requestAnimationFrame(_apply); }
+    };
+    const up = () => {
+      if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+      _commit();
+      setActiveHandle(null);
+      window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', mv);
+    window.addEventListener('mouseup', up);
+  }
+
   const groups = _groupPalettes(palettes);
 
   return (
     <div
+      ref={stripWrapRef}
       style={{
-        position: 'absolute', top: 0, right: 0, bottom: 0, width: 22,
+        position: 'absolute', top: 0, right: 0,
+        bottom: modality === 'PET' ? 38 : modality === 'MIP' ? 37 : 20,
+        width: 22,
         borderLeft: `1px solid ${modality === 'MIP' ? '#cccccc' : '#333'}`,
         cursor: 'ns-resize', userSelect: 'none',
         background: modality === 'MIP' ? '#ffffff' : 'transparent',
@@ -2011,7 +2706,7 @@ function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, 
       }}
       onMouseDown={onMouseDown}
     >
-      {/* Palette selector button — TOP of strip, always visible */}
+      {/* Palette selector button - TOP of strip, always visible */}
       <div
         onMouseEnter={onEnterMenu} onMouseLeave={onLeaveMenu}
         onMouseDown={e => { e.stopPropagation(); e.preventDefault(); }}
@@ -2028,7 +2723,92 @@ function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, 
         }}
       >&#9660;pal</div>
 
-      <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', marginTop: 18 }} />
+      <div style={{ position: 'relative', marginTop: isCompressible ? 20 : 18, height: `calc(100% - ${isCompressible ? 20 : 18}px)` }}>
+        <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%' }} />
+
+        {isCompressible && (
+          <div
+            onMouseDown={_startPanDrag}
+            title="Drag to move both cursors together (gap preserved)"
+            style={{
+              position: 'absolute', inset: 0,
+              cursor: 'move', zIndex: 25, // below the handles (30) so they stay individually grabbable
+            }}
+          />
+        )}
+
+        {isCompressible && (
+          <>
+            {/* Upper bound cursor -- thick line, drag to compress/stretch the
+                TOP of the displayed intensity window. Bar renders DOWNWARD
+                from its target line (marginTop:0) so at the default
+                fracUpper=1 (very top) it stays fully inside the strip
+                instead of poking above it. */}
+            <div
+              onMouseDown={_startHandleDrag('upper')}
+              onMouseEnter={() => setHoverHandle('upper')}
+              onMouseLeave={() => setHoverHandle(h => h === 'upper' ? null : h)}
+              title={`Upper: ${upperDisplay255}`}
+              style={{
+                position: 'absolute', left: -2, right: -2,
+                top: `${(1 - fracUpper) * 100}%`,
+                height: 4, marginTop: 0,
+                background: '#ff3344', boxShadow: '0 0 3px rgba(255,51,68,.9)',
+                cursor: 'ns-resize', zIndex: 30,
+              }}
+            />
+            {/* Lower bound cursor -- bar renders UPWARD from its target line
+                (marginTop:-4) so at the default fracLower=0 (very bottom) it
+                stays fully inside instead of poking below it -- this was the
+                actual cause of the lower cursor being unreachable: at the
+                old centred (marginTop:-2) position, roughly half its hit
+                area sat outside the strip's bounds. */}
+            <div
+              onMouseDown={_startHandleDrag('lower')}
+              onMouseEnter={() => setHoverHandle('lower')}
+              onMouseLeave={() => setHoverHandle(h => h === 'lower' ? null : h)}
+              title={`Lower: ${lowerDisplay255}`}
+              style={{
+                position: 'absolute', left: -2, right: -2,
+                top: `${(1 - fracLower) * 100}%`,
+                height: 4, marginTop: -4,
+                background: '#3388ff', boxShadow: '0 0 3px rgba(51,136,255,.9)',
+                cursor: 'ns-resize', zIndex: 30,
+              }}
+            />
+            {/* Live value label -- shown on hover AND throughout dragging
+                (activeHandle covers the drag case, hoverHandle the idle-
+                hover case), so the user always sees exactly where a cursor
+                is, both at rest and while moving it. */}
+            {(hoverHandle || (activeHandle && activeHandle !== 'pan')) && (
+              <div style={{
+                position: 'absolute', right: '100%', marginRight: 4,
+                top: `${(1 - ((activeHandle || hoverHandle) === 'upper' ? fracUpper : fracLower)) * 100}%`,
+                transform: 'translateY(-50%)',
+                background: 'rgba(12,12,12,.95)', color: '#fff',
+                fontSize: 9, padding: '2px 5px', borderRadius: 3,
+                whiteSpace: 'nowrap', zIndex: 40, pointerEvents: 'none',
+                border: `1px solid ${(activeHandle || hoverHandle) === 'upper' ? '#ff3344' : '#3388ff'}`,
+              }}>
+                {(activeHandle || hoverHandle) === 'upper' ? 'Upper' : 'Lower'}: {(activeHandle || hoverHandle) === 'upper' ? upperDisplay255 : lowerDisplay255}
+              </div>
+            )}
+            {activeHandle === 'pan' && (
+              <div style={{
+                position: 'absolute', right: '100%', marginRight: 4,
+                top: `${(1 - (fracLower + fracUpper) / 2) * 100}%`,
+                transform: 'translateY(-50%)',
+                background: 'rgba(12,12,12,.95)', color: '#fff',
+                fontSize: 9, padding: '2px 5px', borderRadius: 3,
+                whiteSpace: 'nowrap', zIndex: 40, pointerEvents: 'none',
+                border: '1px solid #aaaaaa',
+              }}>
+                {lowerDisplay255}&ndash;{upperDisplay255} (gap {upperDisplay255 - lowerDisplay255})
+              </div>
+            )}
+          </>
+        )}
+      </div>
 
       {showMenu && (
         <div
@@ -2074,17 +2854,77 @@ function ColormapStrip({ paletteId, palettes, wl, modality, onWLDrag, showMenu, 
   );
 }
 
-function _drawStrip(canvas, paletteId, frac) {
+function _drawStrip(canvas, paletteId, frac, drawMarker = true, fracLower = 0, fracUpper = 1) {
   canvas.width  = canvas.offsetWidth  || 22;
   canvas.height = canvas.offsetHeight || 200;
   const ctx = canvas.getContext('2d');
   const { width: w, height: h } = canvas;
   if (!ctx || !w || !h) return;
+  // Determine if this is a PET palette (apply gamma remap) or CT/MIP (direct)
+  // -- but ONLY for the old single-marker (CT) mode. Once the two-cursor
+  // compression is active (drawMarker === false), this gamma curve is
+  // skipped entirely -- see comment below for why.
+  const isCompressed = !drawMarker;
+  const isPET = !isCompressed && paletteId && !paletteId.includes('gray') && !paletteId.includes('greyscale');
+  const isHotIron = paletteId === 'hot_iron';
+  // Compression span: when the two cursors aren't at their default 0/1
+  // positions, squeeze the full 256-colour gradient into the region between
+  // them (clamping solid colour outside) so the strip itself visibly
+  // compresses/expands along with the cursors -- the obvious visual
+  // confirmation that one or both have been moved from their default place.
+  const span = Math.max(0.001, fracUpper - fracLower);
   for (let y = 0; y < h; y++) {
-    const [r,g,b] = getColor(paletteId, 1 - y/(h-1));
-    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    const tScreen   = 1 - y / (h - 1);
+    // Clamped (shaved-off) region: solid white, regardless of which end --
+    // this is what makes it obvious which cursor has been moved no matter
+    // what colour the palette naturally has there (some palettes are
+    // naturally near-white at one end already, which is exactly the case
+    // that made the OTHER end's dark clamp invisible before -- forcing
+    // white uniformly removes that dependency on the palette's own colours).
+    if (isCompressed && (tScreen < fracLower || tScreen > fracUpper)) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, y, w, 1);
+      continue;
+    }
+    const t         = Math.max(0, Math.min(1, (tScreen - fracLower) / span));
+    // FIX: the old gamma remap pow(0.5+t*0.5, 0.75) has a floor of ~0.59 at
+    // t=0 -- it never reaches the dark/extreme end of the palette. Applied
+    // on top of the NEW compression (which already deliberately stretches
+    // the full spectrum across the user's chosen range), this made the
+    // LOWER cursor's boundary blend into a visually-similar mid-tone for
+    // any non-grey palette, looking exactly like "the strip isn't moving"
+    // even though the data and the gradient itself were both updating
+    // correctly. Skipped entirely once compression is active -- the two
+    // cursors already provide the intended visual stretch on their own.
+    const tLookup   = isPET ? Math.min(1, Math.pow(0.10 + t * 0.90, 0.75)) : t;
+    let [r, g, b]   = getColor(paletteId, tLookup);
+    // Boost red 50% for hot_iron (matches buildLUT in canvasFusion.js)
+    if (isHotIron) r = Math.min(255, Math.round(r + (255 - r) * 0.50));
+    const whitePush = (isPET && t > 0.70) ? (t - 0.70) * (1 / 0.30) * 0.20 : 0;
+    const fr = Math.min(255, Math.round(r + (255 - r) * whitePush));
+    const fg = Math.min(255, Math.round(g + (255 - g) * whitePush));
+    const fb = Math.min(255, Math.round(b + (255 - b) * whitePush));
+    ctx.fillStyle = `rgb(${fr},${fg},${fb})`;
     ctx.fillRect(0, y, w, 1);
   }
+  if (isCompressed) {
+    // Boundary line at the white-clamp / gradient transition -- still useful
+    // even with the white fill above, since a palette that's ALSO near-white
+    // right at the edge of its own gradient (some palettes top out near
+    // white) would otherwise blend the white clamp into the gradient with no
+    // visible seam. A black/white dash is visible regardless of what's on
+    // either side.
+    const _drawBoundary = (yPos) => {
+      const y = Math.max(0, Math.min(h - 1, Math.round(yPos)));
+      for (let x = 0; x < w; x++) {
+        ctx.fillStyle = (x % 4 < 2) ? '#ffffff' : '#000000';
+        ctx.fillRect(x, y, 1, 1);
+      }
+    };
+    if (fracLower > 0) _drawBoundary((1 - fracLower) * (h - 1));
+    if (fracUpper < 1) _drawBoundary((1 - fracUpper) * (h - 1));
+  }
+  if (!drawMarker) return; // PET/MIP: the two DOM cursor handles replace this
   const my = Math.round((1 - frac) * (h - 1));
   ctx.fillStyle = '#00e5ff';
   ctx.shadowColor = '#00e5ff'; ctx.shadowBlur = 3;

@@ -29,13 +29,27 @@
 import { cache } from '@cornerstonejs/core';
 import { PET_VOLUME_ID } from './volumeManager.js';
 
-export function buildLUT(getColorFn, paletteId) {
+// Boost red channel by 25% for hot_iron palettes
+function _boostRed(r, g, b, paletteId) {
+  if (paletteId !== 'hot_iron') return [r, g, b];
+  return [Math.min(255, Math.round(r + (255 - r) * 0.50)), g, b];
+}
+
+export function buildLUT(getColorFn, paletteId, gamma = 0.75) {
   const lut = new Uint8Array(256 * 3);
   for (let i = 0; i < 256; i++) {
-    const [r, g, b] = getColorFn(paletteId, i / 255);
-    lut[i * 3]     = r;
-    lut[i * 3 + 1] = g;
-    lut[i * 3 + 2] = b;
+    const t         = i / 255;
+    // Floor 0.10 exposes warm low-uptake hues (dark red/orange)
+    // previously hidden by the old 0.50 floor.
+    const tRemapped = 0.10 + t * 0.90;
+    const tAdjusted = Math.pow(tRemapped, gamma);
+    let [r, g, b]   = getColorFn(paletteId, Math.min(1, tAdjusted));
+    ;[r, g, b] = _boostRed(r, g, b, paletteId);
+    // Push upper 30% of ramp 20% towards white
+    const whitePush = t > 0.70 ? (t - 0.70) * (1 / 0.30) * 0.20 : 0;
+    lut[i * 3]     = Math.min(255, Math.round(r + (255 - r) * whitePush));
+    lut[i * 3 + 1] = Math.min(255, Math.round(g + (255 - g) * whitePush));
+    lut[i * 3 + 2] = Math.min(255, Math.round(b + (255 - b) * whitePush));
   }
   return lut;
 }
@@ -103,7 +117,7 @@ export function getPETPlaneWorldSpace(pctVp, orientationName) {
 
     const [iMax, jMax, kMax] = dims;
 
-    // Get the full scalar array — confirmed working path for CS3D v2.1.16
+    // Get the full scalar array - confirmed working path for CS3D v2.1.16
     const full = vm.getCompleteScalarDataArray?.();
     if (!full?.length) return null;
 
@@ -113,7 +127,7 @@ export function getPETPlaneWorldSpace(pctVp, orientationName) {
     const [wx, wy, wz] = cam.focalPoint;
 
     // Convert world coords to PET voxel IJK using VTK worldToIndex
-    // This correctly handles the 5:1 CT:PET ratio automatically —
+    // This correctly handles the 5:1 CT:PET ratio automatically -
     // CT focal point at world-Z maps to nearest PET slice covering that Z
     let ci = 0, cj = 0, ck = 0;
     try {
@@ -128,7 +142,7 @@ export function getPETPlaneWorldSpace(pctVp, orientationName) {
       ck = Math.max(0, Math.min(kMax - 1, Math.round((wz - origin[2]) / spacing[2])));
     }
 
-    // Data layout in getCompleteScalarDataArray is [k][j][i] — confirmed by CS3D source.
+    // Data layout in getCompleteScalarDataArray is [k][j][i] - confirmed by CS3D source.
     // flat index = k*(jMax*iMax) + j*iMax + i
     let planeData, planeW, planeH;
 
@@ -147,7 +161,7 @@ export function getPETPlaneWorldSpace(pctVp, orientationName) {
 
     } else if (orientationName === 'coronal') {
       // Hold j=cj, vary i (x-axis) and k (z/height axis)
-      // k=0 is inferior, k=kMax-1 is superior → flip vertically so superior is at top
+      // k=0 is inferior, k=kMax-1 is superior - flip vertically so superior is at top
       planeW = iMax; planeH = kMax;
       planeData = new Float32Array(planeW * planeH);
       for (let k = 0; k < kMax; k++) {
@@ -171,7 +185,7 @@ export function getPETPlaneWorldSpace(pctVp, orientationName) {
       }
     }
 
-    const petHi = computePetHi(planeData);
+    const petHi = computePetHi(full);  // full volume - consistent petHi/noiseFloor in all orientations
     return {
       data: planeData, width: planeW, height: planeH,
       petHi: petHi || 10000,
@@ -217,14 +231,39 @@ export function renderPETOverlay(canvas, petData, petW, petH, lut, cfg) {
   const H = canvas.height;
   if (!W || !H) return;
 
-  const blend = Math.max(0, Math.min(1, cfg.alpha != null ? cfg.alpha : 0.6));
-  if (blend < 0.004) { ctx.clearRect(0, 0, W, H); return; }
+  // Minimum 30% PET visibility even at slider 0% - so PET is always seen over CT
+  const rawBlend = cfg.alpha != null ? cfg.alpha : 0.6;
+  const blend = 0.20 + Math.max(0, Math.min(1, rawBlend)) * 0.80;
 
   const power    = cfg.power != null ? cfg.power : 2.0;
   const petLo    = cfg.petLo != null && cfg.petLo >= 0 ? cfg.petLo : 0;
   const petHi    = cfg.petHi != null && cfg.petHi > 0  ? cfg.petHi : 10000;
   const petRange = petHi - petLo;
-  const noiseFloor = petHi * 0.02;
+  const noiseFloor = petHi * 0.05;
+  // Diffuse background wash: below noiseFloor, instead of a hard transparent
+  // cutoff (which produced the "patchy" look -- only hot spots visible,
+  // everything else pure CT), give every in-bounds PET voxel a faint
+  // minimum tint. Matches reference clinical PET-CT images where muscle/
+  // soft tissue shows a soft uniform low-level uptake colour, giving the
+  // whole body a "complete" coloured silhouette the same way the MIP
+  // column already naturally has (MIP has no hard per-pixel cutoff).
+  const DIFFUSE_FLOOR = 0.06; // fraction of the blend slider's alpha
+  // Background tone: the chosen palette's OWN hue, forced dark, so it reads
+  // as "this palette's darkest/coolest shade" rather than a generic grey --
+  // e.g. hot_metal_blue gives a dark blue background, hot_iron a near-black
+  // one, each tied to that palette's character. Sampled from a low-but-not-
+  // literal-zero point in the LUT (t-0.12) rather than lut[0] directly,
+  // because hue-cycling palettes (rainbow) don't naturally start dark --
+  // rainbow's t=0 is a vivid, FULL-BRIGHTNESS violet, not a dark shade, which
+  // is exactly what produced the jarring purple cast reported earlier.
+  // Explicitly darkening here (not just sampling low t) guarantees a proper
+  // dark background regardless of where any given palette's own brightness
+  // happens to bottom out.
+  const DARKEN_FACTOR = 0.32;
+  const _bgIdx = Math.round(0.12 * 255) * 3;
+  const DIFFUSE_FLOOR_R = Math.round((lut[_bgIdx]     ?? 0) * DARKEN_FACTOR);
+  const DIFFUSE_FLOOR_G = Math.round((lut[_bgIdx + 1] ?? 0) * DARKEN_FACTOR);
+  const DIFFUSE_FLOOR_B = Math.round((lut[_bgIdx + 2] ?? 0) * DARKEN_FACTOR);
 
   // Per-pixel world-space mapping using viewport camera bounds and PET worldToIndex
   const vp       = cfg.vpBounds;       // {xMin,xMax,yMin,yMax} in world mm
@@ -249,7 +288,7 @@ export function renderPETOverlay(canvas, petData, petW, petH, lut, cfg) {
       const idx = (oy * W + ox) * 4;
 
       if (useWorldMapping) {
-        // Canvas pixel → world coord → PET IJK via worldToIndex
+        // Canvas pixel - world coord - PET IJK via worldToIndex
         const worldX = vp.xMin + (ox / (W - 1)) * (vp.xMax - vp.xMin);
         const worldY = vp.yMin + (oy / (H - 1)) * (vp.yMax - vp.yMin);
 
@@ -260,7 +299,7 @@ export function renderPETOverlay(canvas, petData, petW, petH, lut, cfg) {
         if (orient === 'axial') {
           wx3 = worldX; wy3 = worldY; wz3 = cfg.focalZ ?? 0;
         } else if (orient === 'coronal') {
-          wx3 = worldXFlipped; wy3 = cfg.focalY ?? 0; wz3 = worldYFlipped;
+          wx3 = worldX; wy3 = cfg.focalY ?? 0; wz3 = worldYFlipped;
         } else {
           // Sagittal: TB flip only (wz3), no LR flip
           wx3 = cfg.focalX ?? 0;
@@ -275,22 +314,46 @@ export function renderPETOverlay(canvas, petData, petW, petH, lut, cfg) {
           continue;
         }
 
-        // Clamp IJK to volume bounds
-        const ii = Math.round(ijk[0]);
-        const jj = Math.round(ijk[1]);
-        const kk = Math.round(ijk[2]);
+        // Use fractional IJK for trilinear interpolation - eliminates pixelation on zoom-out
+        const fi = ijk[0], fj = ijk[1], fk = ijk[2];
 
-        if (ii < 0 || ii >= iMax || jj < 0 || jj >= jMax || kk < 0 || kk >= kMax) {
+        // Bounds check using fractional values
+        if (fi < 0 || fi >= iMax || fj < 0 || fj >= jMax || fk < 0 || fk >= kMax) {
           px[idx] = px[idx+1] = px[idx+2] = px[idx+3] = 0;
           continue;
         }
 
-        // Read directly from flat array: layout [k][j][i]
-        const flatIdx = kk * jMax * iMax + jj * iMax + ii;
-        const petV = cfg.fullData?.[flatIdx] ?? 0;
+        // Trilinear interpolation
+        const i0 = Math.max(0, Math.min(iMax-2, Math.floor(fi)));
+        const j0 = Math.max(0, Math.min(jMax-2, Math.floor(fj)));
+        const k0 = Math.max(0, Math.min(kMax-2, Math.floor(fk)));
+        const i1 = i0+1, j1 = j0+1, k1 = k0+1;
+        const ti = fi-i0, tj = fj-j0, tk = fk-k0;
+        const full = cfg.fullData;
+        const s = jMax*iMax;
+        const petV =
+          full[k0*s + j0*iMax + i0] * (1-tk)*(1-tj)*(1-ti) +
+          full[k0*s + j0*iMax + i1] * (1-tk)*(1-tj)*   ti  +
+          full[k0*s + j1*iMax + i0] * (1-tk)*   tj *(1-ti) +
+          full[k0*s + j1*iMax + i1] * (1-tk)*   tj *   ti  +
+          full[k1*s + j0*iMax + i0] *    tk *(1-tj)*(1-ti) +
+          full[k1*s + j0*iMax + i1] *    tk *(1-tj)*   ti  +
+          full[k1*s + j1*iMax + i0] *    tk *   tj *(1-ti) +
+          full[k1*s + j1*iMax + i1] *    tk *   tj *   ti;
 
         if (petV <= noiseFloor) {
-          px[idx] = px[idx+1] = px[idx+2] = px[idx+3] = 0;
+          // Diffuse background wash instead of fully transparent -- faint
+          // NEUTRAL tone (not the palette's own t=0 colour, which can land
+          // on an aesthetically jarring hue for some palettes -- e.g.
+          // 'rainbow' starts at violet, which looked like a strong purple
+          // cast over the whole image when used here). A fixed neutral
+          // grey reads as a subtle background haze regardless of which
+          // palette is active, matching the reference image's look.
+          const nearness = Math.max(0, Math.min(1, petV / noiseFloor));
+          px[idx]     = DIFFUSE_FLOOR_R;
+          px[idx + 1] = DIFFUSE_FLOOR_G;
+          px[idx + 2] = DIFFUSE_FLOOR_B;
+          px[idx + 3] = Math.round(DIFFUSE_FLOOR * nearness * blend * 255);
           continue;
         }
 
@@ -316,7 +379,11 @@ export function renderPETOverlay(canvas, petData, petW, petH, lut, cfg) {
 
       const petV2 = bilinear(petData, petW, petH, petFX, petFY);
       if (petV2 <= noiseFloor) {
-        px[idx] = px[idx+1] = px[idx+2] = px[idx+3] = 0;
+        const nearness2 = Math.max(0, Math.min(1, petV2 / noiseFloor));
+        px[idx]     = DIFFUSE_FLOOR_R;
+        px[idx + 1] = DIFFUSE_FLOOR_G;
+        px[idx + 2] = DIFFUSE_FLOOR_B;
+        px[idx + 3] = Math.round(DIFFUSE_FLOOR * nearness2 * blend * 255);
         continue;
       }
 

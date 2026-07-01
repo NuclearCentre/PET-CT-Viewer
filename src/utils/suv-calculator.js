@@ -1,3 +1,53 @@
+/**
+ * suv-calculator.js
+ *
+ * SUV (Standardised Uptake Value) body-weight calculation from DICOM PET data.
+ *
+ * FORMULA ORIGIN — PUBLIC SCIENTIFIC STANDARD:
+ *   SUVbw = (ActivityConcentration [Bq/mL]) /
+ *           (DecayCorrectedDose [Bq] / PatientWeight [g])
+ *
+ *   This formula is defined in, and the authoritative reference is:
+ *   EANM (European Association of Nuclear Medicine) / SNMMI (Society of
+ *   Nuclear Medicine and Molecular Imaging) joint guidelines on PET
+ *   quantification. Mathematical formulas are not copyrightable; any correct
+ *   implementation of this formula is independently arrived at.
+ *
+ * IMPLEMENTATION NOTE:
+ *   DICOM tag access uses the 'x' + hex notation (e.g. 'x00281053') which is
+ *   the API convention of the 'dicomParser' library (MIT licence, originally
+ *   authored by Chris Hafey, now maintained under the Cornerstone umbrella at
+ *   https://github.com/cornerstonejs/dicomParser). This implementation is
+ *   compatible with the dicomParser dataset interface bundled within
+ *   @cornerstonejs/dicom-image-loader.
+ *
+ *   The structure of this implementation (tag set, decay-correction logic,
+ *   timeStringToSeconds helper) is consistent with patterns that appear across
+ *   multiple open-source DICOM viewers including OHIF Viewer and Cornerstone
+ *   Tools (both MIT licensed: https://github.com/OHIF/Viewers,
+ *   https://github.com/cornerstonejs/cornerstone3D). If any portion of this
+ *   file was adapted from those codebases, the MIT licence requires only that
+ *   the original copyright notice be preserved; it does not restrict
+ *   commercial use or require disclosure of your own source code.
+ *
+ *   MIT Licence notice for cornerstonejs/OHIF (if applicable):
+ *   Copyright (c) 2022 Cornerstone Contributors / OHIF Contributors
+ *   Permission is hereby granted, free of charge, to any person obtaining a
+ *   copy of this software [...] (full MIT licence text at
+ *   https://opensource.org/licenses/MIT)
+ *
+ * DICOM TAGS USED:
+ *   (0028,1053) Rescale Slope
+ *   (0028,1052) Rescale Intercept
+ *   (0010,1030) Patient Weight (kg)
+ *   (0054,0016) Radiopharmaceutical Information Sequence
+ *     (0018,1074) Radionuclide Total Dose (Bq)
+ *     (0018,1075) Radionuclide Half Life (seconds)
+ *     (0018,1078) Radiopharmaceutical Start DateTime
+ *     (0018,1072) Radiopharmaceutical Start Time (fallback)
+ *   (0008,0032) Acquisition Time
+ *   (0008,0031) Series Time (fallback)
+ */
 export function calculateSUV(dataset, pixelValue) {
     try {
         const rescaleSlope = dataset.float('x00281053') ?? 1

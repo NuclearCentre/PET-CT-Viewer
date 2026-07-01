@@ -164,21 +164,71 @@ function _buildPetOpacityPoints(petWL, globalOpacity) {
 // applyColorMap() does not exist in the VTK version bundled with CS3D v2.1.16.
 // We use removeAllPoints() + addRGBPoint() but call this ONLY between renders,
 // never during an active render cycle, so uniform locations stay valid.
-function _applyActorColormap(actor, paletteId, lower, upper) {
+function _applyActorColormap(actor, paletteId, lower, upper, applyRemap = false, blackFloor = false, preInvertForWhiteBg = false) {
   try {
     const prop = actor.getProperty();
     const cfun = prop.getRGBTransferFunction(0);
     cfun.removeAllPoints();
+    const isHotIron = paletteId === 'hot_iron';
+    const isPET = applyRemap && paletteId && !paletteId.includes('gray') && !paletteId.includes('greyscale');
     for (let i = 0; i < 256; i++) {
       const t      = i / 255;
+      // Only apply gamma remap for Canvas2D-matched paths, not MIP actor
+      const tLookup = isPET ? Math.min(1, Math.pow(0.50 + t * 0.50, 0.75)) : t;
       const scalar = lower + t * (upper - lower);
-      const [r, g, b] = getColor(paletteId, t);
+      let [r, g, b] = getColor(paletteId, tLookup);
+      // Boost red 50% for hot_iron (matches canvasFusion.js buildLUT)
+      if (isHotIron) r = Math.min(255, Math.round(r + (255 - r) * 0.50));
+      // Push upper 50% towards white (only for remapped path)
+      const whitePush = (isPET && t > 0.5) ? (t - 0.5) * 2 * 0.25 : 0;
+      r = Math.min(255, Math.round(r + (255 - r) * whitePush));
+      g = Math.min(255, Math.round(g + (255 - g) * whitePush));
+      b = Math.min(255, Math.round(b + (255 - b) * whitePush));
+      if (blackFloor) {
+        // Force low scalar values toward a single flat shade regardless of
+        // the chosen palette's own colour at t=0 -- several DICOM-standard
+        // palettes (pet, pet_20_step, rainbow) start at blue/green/magenta
+        // rather than black, which for a MIP (max-intensity, no real
+        // transparency compositing) means EVERY ray with even modest
+        // background/noise signal paints solid colour across the whole image
+        // instead of staying flat -- that's the "green background" symptom.
+        // Fade from the floor colour up to the true palette colour over the
+        // bottom ~18% of the range; above that, full true colour as normal.
+        //
+        // FLOOR TARGET: pre-invert and the mandatory CSS invert(1) below
+        // cancel out exactly for every pixel that goes through this
+        // function (invert(invert(x)) = x) -- so whatever is computed HERE
+        // is exactly what ends up on screen. The viewport's actual clear
+        // colour (true background, outside the rendered silhouette) is
+        // black and only passes through ONE inversion (it never touches
+        // this per-voxel LUT), so it displays as white. To match that, the
+        // floor here must target WHITE too when preInvertForWhiteBg is on --
+        // flooring toward black (the old target) made low-uptake areas
+        // INSIDE the silhouette show literal black, clashing with the white
+        // background just outside it.
+        const floorFade = Math.min(1, t / 0.18);
+        const floorTarget = preInvertForWhiteBg ? 255 : 0;
+        r = Math.round(floorTarget + (r - floorTarget) * floorFade);
+        g = Math.round(floorTarget + (g - floorTarget) * floorFade);
+        b = Math.round(floorTarget + (b - floorTarget) * floorFade);
+      }
+      if (preInvertForWhiteBg) {
+        // MIP LOCKED RULE (see setMIPColormap): the viewport's clear colour
+        // is black and the canvas always gets CSS filter:invert(1) (white-
+        // background convention). To still show the TRUE palette colour
+        // after that mandatory invert, store the colour's complement here --
+        // invert(255-r) = r, so the final on-screen result is the real
+        // colour, while black (background / low uptake) still inverts to
+        // white as expected. Applies uniformly to every palette including
+        // gray, where it's a no-op in effect (double inversion cancels out
+        // to the exact same look gray already had).
+        r = 255 - r; g = 255 - g; b = 255 - b;
+      }
       cfun.addRGBPoint(scalar, r / 255, g / 255, b / 255);
     }
     cfun.setMappingRange(lower, upper);
     cfun.modified();
     prop.modified();
-    console.log(`[volumeManager] Applied colormap '${paletteId}' range [${lower.toFixed(0)}, ${upper.toFixed(0)}]`);
   } catch(e) {
     console.error('[volumeManager] _applyActorColormap FAILED:', e?.message, e);
   }
@@ -317,3 +367,107 @@ export function updateFusionCtWL(vp, ctWL) {
 }
 
 
+// ─── MIP colormap update ──────────────────────────────────────────────────────
+// Previous approach: actor always forced to 'gray', colour palettes simulated
+// via a hardcoded CSS hue-rotate/sepia guess-table applied to the canvas. That
+// was fragile in two ways: (1) any palette id not in the hardcoded table
+// silently fell through to 'none' -- no visible change at all, which is
+// exactly the "colour not changing" symptom; (2) even for the mapped entries,
+// hue-rotate is only an approximation of the real palette, not its true
+// colours, and combined with the white-background invert(1) trick it could
+// read as an inverted/wrong-looking colour rather than the actual palette.
+//
+// New approach: for any colour palette OTHER than gray/greyscale, apply the
+// REAL palette colours directly to the actor's colour transfer function
+// (same _applyActorColormap used by CT/PET elsewhere in this file) -- true
+// colour, not a CSS approximation, and never inverted. Background for a
+// colour palette is therefore the actor's own black-to-bright ramp on the
+// viewport's normal (black) background -- the standard look for a coloured
+// PET MIP (e.g. hot_iron: dark background, bright red/orange/yellow hot
+// spots), and it matches the same colours used in the PET-CT fused colour
+// strip elsewhere in the app. The white-background inverted-greyscale look
+// (App.css's filter:invert(1), MIP actor forced to 'gray') is preserved
+// exactly as before, but ONLY for the gray/greyscale/inv_greyscale selection
+// -- that's the one case it was actually designed for.
+export function setMIPColormap(vp, paletteId, petWL) {
+  try {
+    const lower = petWL.wc - petWL.ww / 2;
+    const upper = petWL.wc + petWL.ww / 2;
+    try { vp.setProperties({ voiRange: { lower, upper } }); } catch(e) {}
+
+    const pid = paletteId.replace('petct_', '');
+
+    const petActor = _getActor(vp, PET_VOLUME_ID);
+    if (petActor) {
+      // MIP LOCKED RULE -- white background + TRUE palette colour, for every
+      // palette including gray. Do not change this mechanism without being
+      // explicitly asked to.
+      //   - blackFloor=true always: background/low-uptake stays dark so it
+      //     reads as background regardless of where the chosen palette's own
+      //     ramp starts (matters for pet/pet_20_step/rainbow, harmless no-op
+      //     for palettes that already start at black).
+      //   - preInvertForWhiteBg=true always: bakes the colour's complement
+      //     into the actor so the mandatory CSS invert(1) below cancels back
+      //     out to the TRUE colour, while black still inverts to white.
+      _applyActorColormap(petActor, pid, lower, upper, false, true, true);
+    }
+
+    const _applyFilter = () => {
+      try {
+        const el = vp.element;
+        if (!el) return;
+        // querySelectorAll, not just the first match -- CS3D's render pipeline
+        // can replace/recreate the canvas node on some renders (resize, layout
+        // change, volume swap), which would silently leave a style set on a
+        // now-detached node. Re-selecting fresh each time and applying to
+        // every canvas under this viewport guards against that.
+        // ALWAYS invert(1), for every palette -- see preInvertForWhiteBg note
+        // above. This is what makes the white background work uniformly.
+        // !important: a plain c.style.filter assignment loses to App.css's
+        // rule, which evidently uses !important (confirmed via runtime
+        // diagnostic -- inline was correctly 'none' but computed style still
+        // showed 'invert(1)'). setProperty with 'important' wins over that.
+        el.querySelectorAll('canvas').forEach(c => { c.style.setProperty('filter', 'invert(1)', 'important'); });
+      } catch(e) {}
+    };
+
+    // Apply now, then again next frame after vp.render() below has actually
+    // painted -- covers the case where CS3D's render swaps/recreates the
+    // canvas element between this call and the paint completing.
+    // Rule 32 guard: VTK resets cam.position + cam.parallelScale on every
+    // render() call on an ORTHOGRAPHIC viewport (MIP included). This function
+    // calls render() up to 3 times (immediate + 2x rAF, for the CSS-filter
+    // re-apply timing below) -- without explicitly preserving the camera
+    // across those, each call is a chance for MIP's locked zoom
+    // (ct-coronal x2, set up in ViewportGrid.jsx) to silently shrink back
+    // toward VTK's auto-fit scale. Snapshot before, restore after every
+    // render() in this function.
+    let _savedCam = null;
+    try { _savedCam = vp.getCamera ? vp.getCamera() : null; } catch(e) {}
+    const _restoreCam = () => {
+      if (!_savedCam?.position || !_savedCam?.focalPoint || _savedCam?.parallelScale == null) return;
+      try {
+        vp.setCamera({
+          position:      _savedCam.position,
+          focalPoint:    _savedCam.focalPoint,
+          viewUp:        _savedCam.viewUp,
+          parallelScale: _savedCam.parallelScale,
+        });
+      } catch(e) {}
+    };
+
+    _applyFilter();
+    requestAnimationFrame(_applyFilter);
+
+    vp.render();
+    _restoreCam();
+    // Order matters: restore camera FIRST, then reapply the filter -- setCamera()
+    // can itself trigger a repaint that touches the canvas DOM, which would
+    // silently stomp a filter applied before it. Two settle passes for safety.
+    requestAnimationFrame(() => {
+      _restoreCam();
+      _applyFilter();
+      requestAnimationFrame(() => { _restoreCam(); _applyFilter(); });
+    });
+  } catch(e) {}
+}
